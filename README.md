@@ -1,204 +1,341 @@
-# ytp-dl · v0.2.85
+# ytp-dl
 
-**ytp-dl** is a headless YouTube downloader that tunnels all traffic through
-Mullvad VPN and exposes an optional Flask API.  
-It's packaged for one‑command deployment on a fresh Ubuntu VPS.
+> A lightweight YouTube downloader with Mullvad VPN integration and HTTP API
 
----
+[![PyPI version](https://img.shields.io/pypi/v/ytp-dl.svg)](https://pypi.org/project/ytp-dl/)
+[![Python Support](https://img.shields.io/pypi/pyversions/ytp-dl.svg)](https://pypi.org/project/ytp-dl/)
+[![License](https://img.shields.io/pypi/l/ytp-dl.svg)](https://pypi.org/project/ytp-dl/)
+[![Downloads](https://img.shields.io/pypi/dm/ytp-dl.svg)](https://pypi.org/project/ytp-dl/)
 
-## Features
-
-* `ytp-dl` — CLI: download a video or audio with one line
-* `ytp-dl-api` — Flask server for remote JSON downloads
-* Hard‑coded virtual‑env path `/opt/yt-dlp-mullvad/venv` for consistency
-* Automatic yt‑dlp, thumbnail, and metadata embedding
-* Clear environment validation & helpful error messages
+**ytp-dl** is a privacy-focused YouTube downloader that automatically routes downloads through Mullvad VPN via an HTTP API.
 
 ---
 
-## VPS Installation Guide (PyPI workflow)
+## ✨ Features
 
-**Tested on Ubuntu 22.04 DigitalOcean droplets**
+- 🔒 **Privacy First** — Automatically connects/disconnects Mullvad VPN per download
+- 🎥 **Smart Quality Selection** — Prefers 1080p H.264 + AAC (no transcoding needed)
+- 🎵 **Audio Downloads** — Extract audio as MP3
+- 🚀 **HTTP API** — Simple Flask-based API with concurrency controls
+- ⚡ **VPS Ready** — Includes automated installer script for Ubuntu
+
+---
+
+## 📦 Installation
 
 ```bash
-# 1) SSH in
-ssh root@<droplet_ip>
+pip install ytp-dl==0.4.2
+```
 
-# 2) OS prerequisites
-sudo apt update && sudo apt install -y python3-venv python3-pip curl ffmpeg
+**Requirements:**
+- Linux operating system (tested on Ubuntu 24.04/25.04)
+- [Mullvad CLI](https://mullvad.net/en/download/vpn/linux) installed and configured
+- FFmpeg (for handling audio + video)
+- Python 3.8+
 
-# 3) Mullvad CLI
-curl -fsSLo /tmp/mullvad.deb https://mullvad.net/download/app/deb/latest/
-sudo apt install -y /tmp/mullvad.deb
+---
 
-# 4) Project directory + venv (must match package expectations)
-mkdir -p /opt/yt-dlp-mullvad
-python3 -m venv /opt/yt-dlp-mullvad/venv
-source /opt/yt-dlp-mullvad/venv/bin/activate
+## 🎯 Using Your VPS
 
-# 5) Install from PyPI
+Once your VPS is running, you can download videos using simple HTTP requests:
+
+### Download a Video (1080p MP4)
+
+```bash
+curl -X POST http://YOUR_VPS_IP:5000/api/download \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"}' \
+  --output video.mp4
+```
+
+### Download Audio Only (MP3)
+
+```bash
+curl -X POST http://YOUR_VPS_IP:5000/api/download \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ", "extension": "mp3"}' \
+  --output audio.mp3
+```
+
+### Download at Specific Resolution
+
+```bash
+curl -X POST http://YOUR_VPS_IP:5000/api/download \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ", "resolution": 720}' \
+  --output video.mp4
+```
+
+### Check Server Health
+
+```bash
+curl http://YOUR_VPS_IP:5000/healthz
+```
+
+Response example:
+```json
+{
+  "ok": true,
+  "in_use": 1,
+  "capacity": 2
+}
+```
+
+### Using from Python
+
+```python
+import requests
+
+response = requests.post(
+    "http://YOUR_VPS_IP:5000/api/download",
+    json={
+        "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        "resolution": 1080,
+        "extension": "mp4"
+    },
+    stream=True
+)
+
+if response.status_code == 200:
+    with open("video.mp4", "wb") as f:
+        for chunk in response.iter_content(chunk_size=8192):
+            f.write(chunk)
+elif response.status_code == 503:
+    print("Server busy, try again later")
+else:
+    print(f"Error: {response.json()}")
+```
+
+---
+
+## ⚙️ Configuration
+
+### Installation Script Variables
+
+These environment variables configure the VPS installation:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `PORT` | API server port | `5000` |
+| `APP_DIR` | Installation directory | `/opt/yt-dlp-mullvad` |
+| `MV_ACCOUNT` | Mullvad account number | (none - must set manually) |
+| `MAX_CONCURRENCY` | Max simultaneous downloads | `2` |
+| `MULLVAD_LOCATION` | Mullvad relay location | `us` |
+| `AUTO_REBOOT_CRON` | Cron schedule for auto-reboot | `0 * * * *` (hourly) |
+
+### Runtime Environment Variables
+
+After installation, these variables control the API behavior (set in `/etc/default/ytp-dl-api`):
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `YTPDL_MAX_CONCURRENT` | Maximum concurrent downloads | `2` |
+| `YTPDL_MULLVAD_LOCATION` | Mullvad relay location code | `us` |
+| `YTPDL_VENV` | Path to virtualenv for yt-dlp | `/opt/yt-dlp-mullvad/venv` |
+| `YTPDL_AUDIO_LANG` | Preferred audio language | `en` |
+| `YTPDL_ACCEPT_LANGUAGE` | HTTP Accept-Language header | `en-US,en;q=0.9` |
+
+**Common Mullvad Location Codes:**
+- `us` - United States
+- `uk` - United Kingdom
+- `se` - Sweden
+- `de` - Germany
+- `jp` - Japan
+
+To change configuration after installation:
+```bash
+sudo nano /etc/default/ytp-dl-api
+sudo systemctl restart ytp-dl-api
+```
+
+---
+
+## 🔧 Managing Your VPS Service
+
+### View Service Status
+```bash
+sudo systemctl status ytp-dl-api
+```
+
+### View Logs
+```bash
+sudo journalctl -u ytp-dl-api -f
+```
+
+### Restart Service
+```bash
+sudo systemctl restart ytp-dl-api
+```
+
+### Stop/Start Service
+```bash
+sudo systemctl stop ytp-dl-api
+sudo systemctl start ytp-dl-api
+```
+
+---
+
+## 📋 API Reference
+
+### POST `/api/download`
+
+**Request Body:**
+```json
+{
+  "url": "string (required)",
+  "resolution": "integer (optional, default: 1080)",
+  "extension": "string (optional, 'mp4' or 'mp3')"
+}
+```
+
+**Response:**
+- `200 OK` - File download stream
+- `400 Bad Request` - Missing or invalid URL
+- `500 Internal Server Error` - Download failed
+- `503 Service Unavailable` - Server busy (max concurrent downloads reached)
+
+### GET `/healthz`
+
+**Response:**
+```json
+{
+  "ok": true,
+  "in_use": 1,
+  "capacity": 2
+}
+```
+
+---
+
+## 🖥️ VPS Deployment
+
+**What it does:**
+- ✅ Installs Python, FFmpeg, and Mullvad CLI
+- ✅ Creates virtualenv at `/opt/yt-dlp-mullvad/venv`
+- ✅ Sets up systemd service on port 5000
+- ✅ Configures Gunicorn with gevent workers
+- ✅ Optional hourly auto-reboot via cron
+
+```bash
+#!/usr/bin/env bash
+# VPS_Installation.sh - Minimal Ubuntu 24.04/25.04 setup for ytp-dl API + Mullvad
+#
+# What this does:
+#   - Installs Python, ffmpeg, Mullvad CLI
+#   - Creates a virtualenv at /opt/yt-dlp-mullvad/venv
+#   - Installs ytp-dl==0.4.2 + gunicorn + gevent in that venv
+#   - Creates a simple systemd service ytp-dl-api.service on port 5000
+#   - (NEW) Sets up cron to reboot the droplet on a schedule (default: hourly)
+#
+# Mullvad connect/disconnect is handled per-job by downloader.py.
+
+set -euo pipefail
+
+### --- Tunables -------------------------------------------------------------
+PORT="${PORT:-5000}"                           # API listen port
+APP_DIR="${APP_DIR:-/opt/yt-dlp-mullvad}"      # app/venv root
+VENV_DIR="${VENV_DIR:-${APP_DIR}/venv}"        # python venv
+
+MV_ACCOUNT="${MV_ACCOUNT:-}"                   # Mullvad account (put number after -)
+MAX_CONCURRENCY="${MAX_CONCURRENCY:-2}"        # API concurrency cap
+MULLVAD_LOCATION="${MULLVAD_LOCATION:-us}"     # default Mullvad relay hint
+
+AUTO_REBOOT_CRON="${AUTO_REBOOT_CRON:-0 * * * *}"
+### -------------------------------------------------------------------------
+
+[[ "${EUID}" -eq 0 ]] || { echo "Please run as root"; exit 1; }
+export DEBIAN_FRONTEND=noninteractive
+
+echo "==> 1) Base packages & Mullvad CLI"
+apt-get update
+apt-get install -yq --no-install-recommends \
+  python3-venv python3-pip curl ffmpeg ca-certificates
+
+if ! command -v mullvad >/dev/null 2>&1; then
+  curl -fsSLo /tmp/mullvad.deb https://mullvad.net/download/app/deb/latest/
+  apt-get install -y /tmp/mullvad.deb
+fi
+
+if [[ -n "${MV_ACCOUNT}" ]]; then
+  echo "Logging into Mullvad account (if not already logged in)..."
+  mullvad account login "${MV_ACCOUNT}" || true
+fi
+
+mullvad status || true
+
+echo "==> 2) App dir & virtualenv"
+mkdir -p "${APP_DIR}"
+python3 -m venv "${VENV_DIR}"
+source "${VENV_DIR}/bin/activate"
 pip install --upgrade pip
-pip install ytp-dl==0.2.85
-```
+pip install "ytp-dl==0.4.2" gunicorn gevent
+deactivate
 
-### Quick smoke‑test
+echo "==> 3) API environment file (/etc/default/ytp-dl-api)"
+tee /etc/default/ytp-dl-api >/dev/null <<EOF
+YTPDL_MAX_CONCURRENT=${MAX_CONCURRENCY}
+YTPDL_MULLVAD_LOCATION=${MULLVAD_LOCATION}
+YTPDL_VENV=${VENV_DIR}
+EOF
 
-```bash
-ytp-dl "https://youtu.be/dQw4w9WgXcQ" <mullvad_account> --resolution 720
-# Expect: DOWNLOADED_FILE:/root/Rick Astley - Never Gonna Give You Up.mp4
-```
-
-### Persist the API with systemd
-
-```bash
-sudo tee /etc/systemd/system/ytp-dl-api.service > /dev/null <<'EOF'
+echo "==> 4) Gunicorn systemd service (ytp-dl-api.service on :${PORT})"
+tee /etc/systemd/system/ytp-dl-api.service >/dev/null <<EOF
 [Unit]
-Description=Flask API for ytp-dl Mullvad Downloader
-After=network.target
+Description=Gunicorn for ytp-dl Mullvad API (minimal)
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 User=root
-WorkingDirectory=/opt/yt-dlp-mullvad
-Environment=VIRTUAL_ENV=/opt/yt-dlp-mullvad/venv
-Environment=PATH=/opt/yt-dlp-mullvad/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
-ExecStart=/opt/yt-dlp-mullvad/venv/bin/ytp-dl-api --host 0.0.0.0 --port 5000
+WorkingDirectory=${APP_DIR}
+EnvironmentFile=/etc/default/ytp-dl-api
+Environment=VIRTUAL_ENV=${VENV_DIR}
+Environment=PATH=${VENV_DIR}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+
+ExecStart=${VENV_DIR}/bin/gunicorn -k gevent -w 1 \
+  --worker-connections 200 --timeout 0 --graceful-timeout 15 --keep-alive 20 \
+  --bind 0.0.0.0:${PORT} scripts.api:app
+
 Restart=always
+RestartSec=3
+LimitNOFILE=65535
+MemoryMax=800M
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-sudo systemctl daemon-reload
-sudo systemctl enable --now ytp-dl-api
-systemctl status ytp-dl-api
-```
+echo "==> 5) Start and enable API service"
+systemctl daemon-reload
+systemctl enable --now ytp-dl-api.service
 
-Once running, download via HTTP:
+echo "==> 6) Auto-reboot cron (/etc/cron.d/ytp-dl-auto-reboot)"
+if [[ -n "${AUTO_REBOOT_CRON}" ]]; then
+  REBOOT_BIN="$(command -v reboot || echo /sbin/reboot)"
+  tee /etc/cron.d/ytp-dl-auto-reboot >/dev/null <<EOF
+${AUTO_REBOOT_CRON} root ${REBOOT_BIN}
+EOF
+  chmod 644 /etc/cron.d/ytp-dl-auto-reboot
+  systemctl restart cron || true
+else
+  echo "AUTO_REBOOT_CRON empty; skipping auto-reboot setup."
+fi
 
-```bash
-curl -X POST http://<droplet_ip>:5000/api/download \
-     -H 'Content-Type: application/json' \
-     -d '{"url":"https://youtu.be/dQw4w9WgXcQ","mullvad_account":"<acct>"}' \
-     -O -J
+echo "==> 7) Quick status + health check"
+systemctl status ytp-dl-api --no-pager || true
+
+echo
+echo "Waiting for API to start..."
+sleep 3
+echo "Health (local):"
+curl -sS "http://127.0.0.1:${PORT}/healthz" || true
+
+echo
+echo "========================================="
+echo "Installation complete!"
+echo "API running on port ${PORT}"
+echo "Test from outside: curl http://YOUR_VPS_IP:${PORT}/healthz"
+echo "========================================="
 ```
 
 ---
-
-## CLI Examples
-
-```bash
-# Best quality video (default mp4):
-ytp-dl "<url>" <acct>
-
-# Force 1080p WebM:
-ytp-dl "<url>" <acct> --resolution 1080 --extension webm
-
-# Extract audio as MP3:
-ytp-dl "<url>" <acct> --extension mp3
-```
-
----
-
-## Local Python Script
-
-```python
-#!/usr/bin/env python3
-import requests
-import sys
-import os
-import argparse
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("url", help="YouTube URL")
-    parser.add_argument("--resolution", help="Desired resolution (e.g., 1080)", default=None)
-    parser.add_argument("--extension", help="Desired file extension (e.g., mp4, mp3)", default=None)
-    args = parser.parse_args()
-
-    mullvad_account = ""
-    api_url = "http://<droplet_ip>:5000/api/download"
-
-    payload = {"url": args.url, "mullvad_account": mullvad_account}
-    if args.resolution:
-        payload["resolution"] = args.resolution
-    if args.extension:
-        payload["extension"] = args.extension
-
-    try:
-        with requests.post(api_url, json=payload, stream=True) as response:
-            if response.status_code != 200:
-                print(f"Error: API returned status code {response.status_code}")
-                if response.headers.get("Content-Type") == "application/json":
-                    print(response.json().get("error", "Unknown error"))
-                else:
-                    print("Non-JSON response:", response.text)
-                sys.exit(1)
-
-            content_disposition = response.headers.get("Content-Disposition")
-            filename = None
-            if content_disposition and "filename=" in content_disposition:
-                filename = content_disposition.split("filename=")[1].strip('"')
-            else:
-                filename = "downloaded_video.mp4"
-
-            if os.path.exists(filename):
-                print(f"File already exists: {filename}")
-                sys.exit(0)
-
-            total_size = int(response.headers.get('Content-Length', 0))
-            if total_size == 0:
-                print("Warning: Content-Length header is missing or zero. Progress bar may not be accurate.")
-
-            downloaded_size = 0
-            chunk_size = 8192
-
-            with open(filename, "wb") as f:
-                for chunk in response.iter_content(chunk_size=chunk_size):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded_size += len(chunk)
-                        if total_size > 0:
-                            progress = (downloaded_size / total_size) * 100
-                            print(f"\rDownloading: {progress:.2f}% ({downloaded_size}/{total_size} bytes)", end="", flush=True)
-                        else:
-                            print(f"\rDownloaded: {downloaded_size} bytes", end="", flush=True)
-
-            print(f"\nVideo downloaded successfully: {filename}")
-
-    except requests.RequestException as e:
-        print(f"Error connecting to the API: {e}")
-        sys.exit(1)
-
-if __name__ == "__main__":
-    main()
-```
-
-### Setup
-
-```bash
-# Install required dependency
-pip install requests
-```
-
-### Usage
-
-```bash
-# Basic download
-python ytp-dl.py "https://youtu.be/dQw4w9WgXcQ"
-
-# With specific resolution
-python ytp-dl.py "https://youtu.be/dQw4w9WgXcQ" --resolution 1080
-
-# With specific format
-python ytp-dl.py "https://youtu.be/dQw4w9WgXcQ" --extension mp3
-
-# Combined options
-python ytp-dl.py "https://youtu.be/dQw4w9WgXcQ" --resolution 720 --extension webm
-```
-
-**Note:** You'll need to update the `<droplet_ip>` and `mullvad_account` variables in the script before use.
-
----
-
-## License
-MIT – © dumgum82 2025
