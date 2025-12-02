@@ -42,28 +42,19 @@ Once your VPS is running, you can download videos using simple HTTP requests:
 ### Download a Video (1080p MP4)
 
 ```bash
-curl -X POST http://YOUR_VPS_IP:5000/api/download \
-  -H "Content-Type: application/json" \
-  -d '{"url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"}' \
-  --output video.mp4
+curl -X POST http://YOUR_VPS_IP:5000/api/download       -H "Content-Type: application/json"       -d '{"url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"}'       --output video.mp4
 ```
 
 ### Download Audio Only (MP3)
 
 ```bash
-curl -X POST http://YOUR_VPS_IP:5000/api/download \
-  -H "Content-Type: application/json" \
-  -d '{"url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ", "extension": "mp3"}' \
-  --output audio.mp3
+curl -X POST http://YOUR_VPS_IP:5000/api/download       -H "Content-Type: application/json"       -d '{"url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ", "extension": "mp3"}'       --output audio.mp3
 ```
 
 ### Download at Specific Resolution
 
 ```bash
-curl -X POST http://YOUR_VPS_IP:5000/api/download \
-  -H "Content-Type: application/json" \
-  -d '{"url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ", "resolution": 720}' \
-  --output video.mp4
+curl -X POST http://YOUR_VPS_IP:5000/api/download       -H "Content-Type: application/json"       -d '{"url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ", "resolution": 720}'       --output video.mp4
 ```
 
 ### Check Server Health
@@ -112,35 +103,31 @@ else:
 
 ### Installation Script Variables
 
-These environment variables configure the VPS installation:
+These environment variables configure the VPS installation (they can be overridden when running the script):
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `PORT` | API server port | `5000` |
-| `APP_DIR` | Installation directory | `/opt/yt-dlp-mullvad` |
-| `MV_ACCOUNT` | Mullvad account number | (none - must set manually) |
-| `MAX_CONCURRENCY` | Max simultaneous downloads | `2` |
-| `MULLVAD_LOCATION` | Mullvad relay location | `us` |
-| `AUTO_REBOOT_CRON` | Cron schedule for auto-reboot | `0 * * * *` (hourly) |
+| Variable            | Description                                       | Default                  |
+|---------------------|---------------------------------------------------|--------------------------|
+| `PORT`              | API server port                                   | `5000`                   |
+| `APP_DIR`           | Installation directory                            | `/opt/yt-dlp-mullvad`    |
+| `MV_ACCOUNT`        | Mullvad account number (optional)                 | empty                    |
+| `MAX_CONCURRENCY`   | Max simultaneous downloads                        | `2`                      |
+| `MULLVAD_LOCATION`  | Mullvad relay location hint                       | `us`                     |
+| `AUTO_REBOOT_CRON`  | Cron schedule for auto-reboot                     | `0 * * * *` (hourly)     |
+
+Notes:
+
+- If `MV_ACCOUNT` is set, the installer attempts `mullvad account login <MV_ACCOUNT>` once.
+- If `MV_ACCOUNT` is left empty, the script skips login and assumes Mullvad is already configured.
 
 ### Runtime Environment Variables
 
-After installation, these variables control the API behavior (set in `/etc/default/ytp-dl-api`):
+After installation, these variables control the API behavior. They are set in `/etc/default/ytp-dl-api` and can be edited manually:
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `YTPDL_MAX_CONCURRENT` | Maximum concurrent downloads | `2` |
-| `YTPDL_MULLVAD_LOCATION` | Mullvad relay location code | `us` |
-| `YTPDL_VENV` | Path to virtualenv for yt-dlp | `/opt/yt-dlp-mullvad/venv` |
-| `YTPDL_AUDIO_LANG` | Preferred audio language | `en` |
-| `YTPDL_ACCEPT_LANGUAGE` | HTTP Accept-Language header | `en-US,en;q=0.9` |
-
-**Common Mullvad Location Codes:**
-- `us` - United States
-- `uk` - United Kingdom
-- `se` - Sweden
-- `de` - Germany
-- `jp` - Japan
+| Variable                 | Description                         | Default                        |
+|--------------------------|-------------------------------------|--------------------------------|
+| `YTPDL_MAX_CONCURRENT`   | Maximum concurrent downloads        | `2`                            |
+| `YTPDL_MULLVAD_LOCATION` | Mullvad relay location code         | `us`                           |
+| `YTPDL_VENV`             | Path to virtualenv for ytp-dl       | `/opt/yt-dlp-mullvad/venv`     |
 
 To change configuration after installation:
 ```bash
@@ -212,6 +199,7 @@ sudo systemctl start ytp-dl-api
 **What it does:**
 - ✅ Installs Python, FFmpeg, and Mullvad CLI
 - ✅ Creates virtualenv at `/opt/yt-dlp-mullvad/venv`
+- ✅ Installs `ytp-dl==0.4.2` into the virtualenv
 - ✅ Sets up systemd service on port 5000
 - ✅ Configures Gunicorn with gevent workers
 - ✅ Optional hourly auto-reboot via cron
@@ -248,8 +236,7 @@ export DEBIAN_FRONTEND=noninteractive
 
 echo "==> 1) Base packages & Mullvad CLI"
 apt-get update
-apt-get install -yq --no-install-recommends \
-  python3-venv python3-pip curl ffmpeg ca-certificates
+apt-get install -yq --no-install-recommends       python3-venv python3-pip curl ffmpeg ca-certificates
 
 if ! command -v mullvad >/dev/null 2>&1; then
   curl -fsSLo /tmp/mullvad.deb https://mullvad.net/download/app/deb/latest/
@@ -279,7 +266,7 @@ YTPDL_VENV=${VENV_DIR}
 EOF
 
 echo "==> 4) Gunicorn systemd service (ytp-dl-api.service on :${PORT})"
-tee /etc/systemd/system/ytp-dl-api.service >/dev/null <<EOF
+tee /etc/systemd/system/ytp-dl-api.service >/dev-null <<EOF
 [Unit]
 Description=Gunicorn for ytp-dl Mullvad API (minimal)
 After=network-online.target
@@ -292,9 +279,7 @@ EnvironmentFile=/etc/default/ytp-dl-api
 Environment=VIRTUAL_ENV=${VENV_DIR}
 Environment=PATH=${VENV_DIR}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 
-ExecStart=${VENV_DIR}/bin/gunicorn -k gevent -w 1 \
-  --worker-connections 200 --timeout 0 --graceful-timeout 15 --keep-alive 20 \
-  --bind 0.0.0.0:${PORT} scripts.api:app
+ExecStart=${VENV_DIR}/bin/gunicorn -k gevent -w 1       --worker-connections 200 --timeout 0 --graceful-timeout 15 --keep-alive 20       --bind 0.0.0.0:${PORT} scripts.api:app
 
 Restart=always
 RestartSec=3
@@ -337,5 +322,3 @@ echo "API running on port ${PORT}"
 echo "Test from outside: curl http://YOUR_VPS_IP:${PORT}/healthz"
 echo "========================================="
 ```
-
----
