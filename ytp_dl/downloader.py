@@ -1,147 +1,227 @@
 #!/usr/bin/env python3
-import subprocess
-import sys
+from __future__ import annotations
 import os
-import time
+import shlex
 import shutil
+import subprocess
+import time
+from typing import Optional, List
 
-def run_command(cmd, check=True):
-    try:
-        result = subprocess.run(
-            cmd, shell=True, check=check,
+# =========================
+# Config / constants
+# =========================
+VENV_PATH = os.environ.get("YTPDL_VENV", "/opt/yt-dlp-mullvad/venv")
+YTDLP_BIN = os.path.join(VENV_PATH, "bin", "yt-dlp")
+MULLVAD_LOCATION = os.environ.get("YTPDL_MULLVAD_LOCATION", "us")
+MODERN_UA = os.environ.get(
+    "YTPDL_USER_AGENT",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+FFMPEG_BIN = shutil.which("ffmpeg") or "ffmpeg"
+
+# =========================
+# Shell helpers
+# =========================
+def _run_argv(argv: List[str], check: bool = True) -> str:
+    res = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if check and res.returncode != 0:
+        cmd = " ".join(shlex.quote(p) for p in argv)
+        raise RuntimeError(f"Command failed: {cmd}\n{res.stdout}")
+    return res.stdout
+
+# =========================
+# Environment / Mullvad
+# =========================
+def validate_environment() -> None:
+    if not os.path.exists(YTDLP_BIN):
+        raise RuntimeError(f"yt-dlp not found at {YTDLP_BIN}")
+    if shutil.which(FFMPEG_BIN) is None:
+        raise RuntimeError("ffmpeg not found on PATH")
+
+def _mullvad_present() -> bool:
+    return shutil.which("mullvad") is not None
+
+def mullvad_logged_in() -> bool:
+    if not _mullvad_present():
+        return False
+    res = subprocess.run(
+        ["mullvad", "account", "get"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    return "not logged in" not in (res.stdout or "").lower()
+
+def require_mullvad_login() -> None:
+    if _mullvad_present() and not mullvad_logged_in():
+        raise RuntimeError("Mullvad not logged in. Run: mullvad account login <ACCOUNT>")
+
+def mullvad_connect(location: Optional[str] = None) -> None:
+    if not _mullvad_present():
+        return
+    loc = (location or MULLVAD_LOCATION).strip()
+    _run_argv(["mullvad", "disconnect"], check=False)
+    if loc:
+        _run_argv(["mullvad", "relay", "set", "location", loc], check=False)
+    _run_argv(["mullvad", "connect"], check=False)
+
+def mullvad_wait_connected(timeout: int = 20) -> bool:
+    if not _mullvad_present():
+        return True
+    for _ in range(timeout):
+        res = subprocess.run(
+            ["mullvad", "status"],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True
+            text=True,
         )
-        return result.stdout.strip()
-    except subprocess.CalledProcessError as e:
-        print(f"Command failed: {cmd}\nError: {e.output}")
-        raise
-
-def get_venv_path():
-    """Get the expected virtual environment path"""
-    return "/opt/yt-dlp-mullvad/venv"
-
-def validate_environment():
-    """Validate that we're running in the correct environment"""
-    venv_path = get_venv_path()
-    
-    # Check if we're in the expected venv
-    current_venv = os.environ.get('VIRTUAL_ENV')
-    if not current_venv or current_venv != venv_path:
-        print(f"Error: This package must be installed and run from the virtual environment at {venv_path}")
-        print(f"Current VIRTUAL_ENV: {current_venv}")
-        print("\nTo fix this:")
-        print(f"1. Create virtual environment: python3 -m venv {venv_path}")
-        print(f"2. Activate it: source {venv_path}/bin/activate")
-        print("3. Install package: pip install ytp-dl")
-        sys.exit(1)
-    
-    # Check if yt-dlp is available
-    ytdlp_path = f"{venv_path}/bin/yt-dlp"
-    if not os.path.exists(ytdlp_path):
-        print(f"Error: yt-dlp not found at {ytdlp_path}")
-        print("This should have been installed automatically. Try reinstalling the package.")
-        sys.exit(1)
-    
-    return venv_path
-
-def check_mullvad():
-    """Check if Mullvad CLI is available"""
-    if not shutil.which("mullvad"):
-        print("Error: Mullvad CLI not found.")
-        print("Please install Mullvad VPN:")
-        print("curl -fsSLo /tmp/mullvad.deb https://mullvad.net/download/app/deb/latest/")
-        print("sudo apt install -y /tmp/mullvad.deb")
-        sys.exit(1)
-
-def wait_for_connection(timeout=10):
-    """Poll Mullvad status until connected or timeout"""
-    for _ in range(timeout):
-        status = run_command("mullvad status")
-        if "Connected" in status:
-            print("Mullvad VPN connected.")
+        if "Connected" in res.stdout:
             return True
         time.sleep(1)
-    print("Failed to confirm Mullvad VPN connection within timeout.")
     return False
 
-def download_video(url, mullvad_account, resolution=None, extension=None):
-    """
-    Download a video using yt-dlp through Mullvad VPN
-    
-    Args:
-        url (str): YouTube URL
-        mullvad_account (str): Mullvad account number
-        resolution (str, optional): Desired resolution (e.g., '1080')
-        extension (str, optional): Desired file extension (e.g., 'mp4', 'mp3')
-    
-    Returns:
-        str: Path to downloaded file or None if failed
-    """
-    venv_path = validate_environment()
-    check_mullvad()
-    
-    print("Logging into Mullvad...")
-    run_command(f"mullvad account login {mullvad_account}")
-    
-    print("Connecting to Mullvad VPN...")
-    run_command("mullvad connect")
+# =========================
+# yt-dlp helpers
+# =========================
+def _extract_downloaded_filename(stdout: str) -> Optional[str]:
+    for line in (stdout or "").splitlines():
+        if "[download] Destination:" in line:
+            return line.split("Destination:", 1)[1].strip()
+        if "] " in line and " has already been downloaded" in line:
+            return (
+                line.split("] ", 1)[1]
+                .split(" has already been downloaded")[0]
+                .strip()
+                .strip("'\"")
+            )
+    return None
 
-    if not wait_for_connection():
-        sys.exit(1)
+def _common_flags() -> List[str]:
+    return [
+        "--retries", "10",
+        "--fragment-retries", "10",
+        "--retry-sleep", "exp=1:30",
+        "--user-agent", MODERN_UA,
+        "--no-cache-dir",
+        "--ignore-config",
+        "--embed-metadata",
+        "--sleep-interval", "1",
+    ]
 
-    print(f"Downloading: {url}")
-    
+def _download_with_format(url: str, out_tpl: str, fmt: str) -> str:
+    argv = [YTDLP_BIN, "-f", fmt, *(_common_flags()), "--output", out_tpl, url]
+    out = _run_argv(argv, check=False)
+    path = _extract_downloaded_filename(out)
+    if not path or not os.path.exists(path):
+        raise RuntimeError(f"Failed to download format: {fmt}")
+    return os.path.abspath(path)
+
+# =========================
+# Main download logic
+# =========================
+def _download_best_video(url: str, out_dir: str, cap: int = 1080) -> str:
+    out_tpl = os.path.join(out_dir, "%(title)s.%(ext)s")
+
+    # 1. Exact 1080p H.264 + AAC in MP4 (perfect, no remux)
     try:
-        audio_extensions = ["mp3", "m4a", "aac", "wav", "flac", "opus", "ogg"]
-        if extension and extension in audio_extensions:
-            # Audio download
-            ytdlp_cmd = (
-                f"{venv_path}/bin/yt-dlp -x --audio-format {extension} "
-                f"--embed-metadata "
-                f"--output '/root/%(title)s.%(ext)s' "
-                f"--user-agent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36' {url}"
-            )
-        else:
-            # Video download
-            if resolution:
-                format_filter = f"bestvideo[height<={resolution}]+bestaudio/best[height<={resolution}]"
-            else:
-                format_filter = "bestvideo+bestaudio"
-            
-            merge_extension = extension if extension else "mp4"
-            ytdlp_cmd = (
-                f"{venv_path}/bin/yt-dlp -f '{format_filter}' --merge-output-format {merge_extension} "
-                f"--embed-thumbnail --embed-metadata "
-                f"--output '/root/%(title)s.%(ext)s' "
-                f"--user-agent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36' {url}"
-            )
-        
-        output = run_command(ytdlp_cmd)
-        filename = None
-        for line in output.splitlines():
-            if line.startswith("[download]"):
-                if "Destination:" in line:
-                    filename = line.split("Destination: ")[1].strip()
-                elif "has already been downloaded" in line:
-                    start = line.find("] ") + 2
-                    end = line.find(" has already been downloaded")
-                    filename = line[start:end].strip()
-                if filename and filename.startswith("'") and filename.endswith("'"):
-                    filename = filename[1:-1]
-                break
-        
-        if filename and os.path.exists(filename):
-            print(f"DOWNLOADED_FILE:{filename}")
-            return filename
-        else:
-            print("Download failed: File not found")
-            return None
-            
-    except subprocess.CalledProcessError as e:
-        print(f"yt-dlp failed with error: {e.output}")
-        return None
+        return _download_with_format(
+            url,
+            out_tpl,
+            "bv*[height=1080][vcodec~='^(avc1|h264)'][ext=mp4]"
+            "+ba[acodec~='^mp4a'][ext=m4a]"
+            "/b[height=1080][vcodec~='^(avc1|h264)'][ext=mp4]",
+        )
+    except Exception:
+        pass
+
+    # 2. Exact 1080p any codec/container
+    try:
+        return _download_with_format(url, out_tpl, "bv*[height=1080]+ba/b[height=1080]")
+    except Exception:
+        pass
+
+    # 3. Best available <= cap
+    return _download_with_format(
+        url, out_tpl, f"bv*[height<={cap}]+ba/b[height<={cap}]"
+    )
+
+def _download_best_audio(url: str, out_dir: str) -> str:
+    out_tpl = os.path.join(out_dir, "%(title)s.audio.%(ext)s")
+    return _download_with_format(url, out_tpl, "bestaudio")
+
+def _merge_av(video_path: str, audio_path: str) -> str:
+    base, ext = os.path.splitext(video_path)
+    temp = base + ".merged" + ext
+    argv = [
+        FFMPEG_BIN,
+        "-y",
+        "-i",
+        video_path,
+        "-i",
+        audio_path,
+        "-c",
+        "copy",
+        "-map",
+        "0:v",
+        "-map",
+        "1:a",
+        temp,
+    ]
+    _run_argv(argv, check=True)
+    os.replace(temp, video_path)
+    try:
+        os.remove(audio_path)
+    except Exception:
+        pass
+    return video_path
+
+# =========================
+# Public API
+# =========================
+def download_video(
+    url: str,
+    resolution: int | None = 1080,
+    extension: Optional[str] = None,
+    out_dir: str = "/root",
+) -> str:
+    if not url:
+        raise RuntimeError("Missing URL")
+    os.makedirs(out_dir, exist_ok=True)
+
+    validate_environment()
+    require_mullvad_login()
+    mullvad_connect(MULLVAD_LOCATION)
+    if not mullvad_wait_connected():
+        raise RuntimeError("Mullvad connection failed")
+
+    try:
+        cap = int(resolution or 1080)
+
+        if extension and extension.lower() == "mp3":
+            out_tpl = os.path.join(out_dir, "%(title)s.%(ext)s")
+            argv = [
+                YTDLP_BIN,
+                "-x",
+                "--audio-format",
+                "mp3",
+                *(_common_flags()),
+                "--output",
+                out_tpl,
+                url,
+            ]
+            out = _run_argv(argv, check=False)
+            path = _extract_downloaded_filename(out)
+            if not path or not os.path.exists(path):
+                raise RuntimeError("MP3 download failed")
+            return os.path.abspath(path)
+
+        # Video + audio (merged)
+        video_path = _download_best_video(url, out_dir, cap)
+        audio_path = _download_best_audio(url, out_dir)
+        return _merge_av(video_path, audio_path)
+
     finally:
-        print("Disconnecting VPN...")
-        run_command("mullvad disconnect")
+        if _mullvad_present():
+            _run_argv(["mullvad", "disconnect"], check=False)
