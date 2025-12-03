@@ -105,14 +105,14 @@ else:
 
 These environment variables configure the VPS installation (they can be overridden when running the script):
 
-| Variable                 | Description                               | Default               |
-|--------------------------|-------------------------------------------|-----------------------|
-| `PORT`                   | API server port                           | `5000`                |
-| `APP_DIR`                | Installation directory                    | `/opt/yt-dlp-mullvad` |
-| `MV_ACCOUNT`             | Mullvad account number                    | your mullvad id       |
-| `YTPDL_MAX_CONCURRENT`   | Max simultaneous downloads (API cap)      | `1`                   |
-| `YTPDL_MULLVAD_LOCATION` | Mullvad relay location code (e.g. `us`)   | `us`                  |
-| `AUTO_REBOOT_CRON`       | Cron schedule for auto-reboot             | `0 * * * *` (hourly)  |
+| Variable                 | Description                               | Default                 |
+|--------------------------|-------------------------------------------|-------------------------|
+| `PORT`                   | API server port                           | `5000`                  |
+| `APP_DIR`                | Installation directory                    | `/opt/yt-dlp-mullvad`   |
+| `MV_ACCOUNT`             | Mullvad account number                    | your mullvad id         |
+| `YTPDL_MAX_CONCURRENT`   | Max simultaneous downloads (API cap)      | `1`                     |
+| `YTPDL_MULLVAD_LOCATION` | Mullvad relay location code (e.g. `us`)   | `us`                    |
+| `AUTO_REBOOT_CRON`       | Cron schedule for auto-reboot             | `*/30 * * * *` (30 mins)|
 
 Notes:
 
@@ -228,7 +228,7 @@ MV_ACCOUNT="${MV_ACCOUNT:-}"                   # Mullvad account (put number aft
 YTPDL_MAX_CONCURRENT="${YTPDL_MAX_CONCURRENT:-1}"        # API concurrency cap
 YTPDL_MULLVAD_LOCATION="${YTPDL_MULLVAD_LOCATION:-us}"   # default Mullvad relay hint
 
-AUTO_REBOOT_CRON="${AUTO_REBOOT_CRON:-0 * * * *}"
+AUTO_REBOOT_CRON="${AUTO_REBOOT_CRON:-*/30 * * * *}"
 ### -------------------------------------------------------------------------
 
 [[ "${EUID}" -eq 0 ]] || { echo "Please run as root"; exit 1; }
