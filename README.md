@@ -13,25 +13,31 @@
 
 ## ✨ Features
 
-- 🔒 **Privacy First** — Automatically connects/disconnects Mullvad VPN per download
-- 🎥 **Smart Quality Selection** — Prefers 1080p H.264 + AAC (no transcoding needed)
-- 🎵 **Audio Downloads** — Extract audio as MP3
-- 🚀 **HTTP API** — Simple Flask-based API with concurrency controls
-- ⚡ **VPS Ready** — Includes automated installer script for Ubuntu
+* 🔒 **Privacy First** — Automatically connects/disconnects Mullvad VPN per download
+* 🎥 **Smart Quality Selection** — Prefers 1080p H.264 + AAC (no transcoding needed)
+* 🎵 **Audio Downloads** — Extract audio as MP3
+* 🚀 **HTTP API** — Simple Flask-based API with concurrency controls
+* ⚡ **VPS Ready** — Includes automated installer script for Ubuntu
 
 ---
 
 ## 📦 Installation
 
 ```bash
-pip install ytp-dl==0.4.3
+pip install ytp-dl==0.6.3 yt-dlp[default]
 ```
 
 **Requirements:**
-- Linux operating system (tested on Ubuntu 24.04/25.04)
-- [Mullvad CLI](https://mullvad.net/en/download/vpn/linux) installed and configured
-- FFmpeg (for handling audio + video)
-- Python 3.8+
+
+* Linux operating system (tested on Ubuntu 24.04/25.04)
+* [Mullvad CLI](https://mullvad.net/en/download/vpn/linux) installed and configured
+* FFmpeg (for handling audio + video)
+* Deno (system-wide, required by yt-dlp for modern YouTube extraction)
+* Python 3.8+
+
+Notes:
+
+* yt-dlp expects **Deno** to be available on `PATH` to run its JavaScript-based extraction logic.
 
 ---
 
@@ -64,6 +70,7 @@ curl http://YOUR_VPS_IP:5000/healthz
 ```
 
 Response example:
+
 ```json
 {
   "ok": true,
@@ -105,31 +112,31 @@ else:
 
 These environment variables configure the VPS installation (they can be overridden when running the script):
 
-| Variable                 | Description                               | Default                 |
-|--------------------------|-------------------------------------------|-------------------------|
-| `PORT`                   | API server port                           | `5000`                  |
-| `APP_DIR`                | Installation directory                    | `/opt/yt-dlp-mullvad`   |
-| `MV_ACCOUNT`             | Mullvad account number                    | your mullvad id         |
-| `YTPDL_MAX_CONCURRENT`   | Max simultaneous downloads (API cap)      | `1`                     |
-| `YTPDL_MULLVAD_LOCATION` | Mullvad relay location code (e.g. `us`)   | `us`                    |
-| `AUTO_REBOOT_CRON`       | Cron schedule for auto-reboot             | `*/30 * * * *` (30 mins)|
+| Variable                 | Description                             | Default               |
+| ------------------------ | --------------------------------------- | --------------------- |
+| `PORT`                   | API server port                         | `5000`                |
+| `APP_DIR`                | Installation directory                  | `/opt/yt-dlp-mullvad` |
+| `MV_ACCOUNT`             | Mullvad account number                  | your mullvad id       |
+| `YTPDL_MAX_CONCURRENT`   | Max simultaneous downloads (API cap)    | `1`                   |
+| `YTPDL_MULLVAD_LOCATION` | Mullvad relay location code (e.g. `us`) | `us`                  |
 
 Notes:
 
-- If `MV_ACCOUNT` is set, the installer attempts `mullvad account login <MV_ACCOUNT>` once.
-- If `MV_ACCOUNT` is left empty, the script skips login and assumes Mullvad is already configured.
+* If `MV_ACCOUNT` is set, the installer attempts `mullvad account login <MV_ACCOUNT>` once.
+* If `MV_ACCOUNT` is left empty, the script skips login and assumes Mullvad is already configured.
 
 ### Runtime Environment Variables
 
 After installation, these variables control the API behavior. They are set in `/etc/default/ytp-dl-api` and can be edited manually:
 
-| Variable                 | Description                         | Default                        |
-|--------------------------|-------------------------------------|--------------------------------|
-| `YTPDL_MAX_CONCURRENT`   | Maximum concurrent downloads        | `1`                            |
-| `YTPDL_MULLVAD_LOCATION` | Mullvad relay location code         | `us`                           |
-| `YTPDL_VENV`             | Path to virtualenv for ytp-dl       | `/opt/yt-dlp-mullvad/venv`     |
+| Variable                 | Description                   | Default                    |
+| ------------------------ | ----------------------------- | -------------------------- |
+| `YTPDL_MAX_CONCURRENT`   | Maximum concurrent downloads  | `1`                        |
+| `YTPDL_MULLVAD_LOCATION` | Mullvad relay location code   | `us`                       |
+| `YTPDL_VENV`             | Path to virtualenv for ytp-dl | `/opt/yt-dlp-mullvad/venv` |
 
 To change configuration after installation:
+
 ```bash
 sudo nano /etc/default/ytp-dl-api
 sudo systemctl restart ytp-dl-api
@@ -140,21 +147,25 @@ sudo systemctl restart ytp-dl-api
 ## 🔧 Managing Your VPS Service
 
 ### View Service Status
+
 ```bash
 sudo systemctl status ytp-dl-api
 ```
 
 ### View Logs
+
 ```bash
 sudo journalctl -u ytp-dl-api -f
 ```
 
 ### Restart Service
+
 ```bash
 sudo systemctl restart ytp-dl-api
 ```
 
 ### Stop/Start Service
+
 ```bash
 sudo systemctl stop ytp-dl-api
 sudo systemctl start ytp-dl-api
@@ -167,6 +178,7 @@ sudo systemctl start ytp-dl-api
 ### POST `/api/download`
 
 **Request Body:**
+
 ```json
 {
   "url": "string (required)",
@@ -176,14 +188,16 @@ sudo systemctl start ytp-dl-api
 ```
 
 **Response:**
-- `200 OK` - File download stream
-- `400 Bad Request` - Missing or invalid URL
-- `500 Internal Server Error` - Download failed
-- `503 Service Unavailable` - Server busy (max concurrent downloads reached)
+
+* `200 OK` - File download stream
+* `400 Bad Request` - Missing or invalid URL
+* `500 Internal Server Error` - Download failed
+* `503 Service Unavailable` - Server busy (max concurrent downloads reached)
 
 ### GET `/healthz`
 
 **Response:**
+
 ```json
 {
   "ok": true,
@@ -197,12 +211,13 @@ sudo systemctl start ytp-dl-api
 ## 🖥️ VPS Deployment
 
 **What it does:**
-- ✅ Installs Python, FFmpeg, and Mullvad CLI
-- ✅ Creates virtualenv at `/opt/yt-dlp-mullvad/venv`
-- ✅ Installs `ytp-dl==0.4.3` into the virtualenv
-- ✅ Sets up systemd service on port 5000
-- ✅ Configures Gunicorn with gevent workers
-- ✅ Optional hourly auto-reboot via cron
+
+* ✅ Installs Python, FFmpeg, and Mullvad CLI
+* ✅ Installs Deno system-wide (required by yt-dlp for modern YouTube extraction)
+* ✅ Creates virtualenv at `/opt/yt-dlp-mullvad/venv`
+* ✅ Installs `ytp-dl==0.6.3` + `yt-dlp[default]` into the virtualenv
+* ✅ Sets up systemd service on port 5000
+* ✅ Configures Gunicorn with gevent workers
 
 ```bash
 #!/usr/bin/env bash
@@ -210,10 +225,10 @@ sudo systemctl start ytp-dl-api
 #
 # What this does:
 #   - Installs Python, ffmpeg, Mullvad CLI
+#   - Installs Deno system-wide (JS runtime required for modern YouTube extraction via yt-dlp)
 #   - Creates a virtualenv at /opt/yt-dlp-mullvad/venv
-#   - Installs ytp-dl==0.4.3 + gunicorn + gevent in that venv
+#   - Installs ytp-dl==0.6.3 + yt-dlp[default] + gunicorn + gevent in that venv
 #   - Creates a simple systemd service ytp-dl-api.service on port 5000
-#   - (NEW) Sets up cron to reboot the droplet on a schedule (default: hourly)
 #
 # Mullvad connect/disconnect is handled per-job by downloader.py.
 
@@ -227,8 +242,6 @@ VENV_DIR="${VENV_DIR:-${APP_DIR}/venv}"        # python venv
 MV_ACCOUNT="${MV_ACCOUNT:-}"                   # Mullvad account (put number after -)
 YTPDL_MAX_CONCURRENT="${YTPDL_MAX_CONCURRENT:-1}"        # API concurrency cap
 YTPDL_MULLVAD_LOCATION="${YTPDL_MULLVAD_LOCATION:-us}"   # default Mullvad relay hint
-
-AUTO_REBOOT_CRON="${AUTO_REBOOT_CRON:-*/30 * * * *}"
 ### -------------------------------------------------------------------------
 
 [[ "${EUID}" -eq 0 ]] || { echo "Please run as root"; exit 1; }
@@ -236,7 +249,7 @@ export DEBIAN_FRONTEND=noninteractive
 
 echo "==> 1) Base packages & Mullvad CLI"
 apt-get update
-apt-get install -yq --no-install-recommends   python3-venv python3-pip curl ffmpeg ca-certificates
+apt-get install -yq --no-install-recommends   python3-venv python3-pip curl ffmpeg ca-certificates unzip
 
 if ! command -v mullvad >/dev/null 2>&1; then
   curl -fsSLo /tmp/mullvad.deb https://mullvad.net/download/app/deb/latest/
@@ -250,12 +263,20 @@ fi
 
 mullvad status || true
 
+echo "==> 1.5) Install Deno (system-wide, for yt-dlp YouTube extraction)"
+# Install into /usr/local/bin/deno so systemd PATH can see it.
+# Official installer supports system-wide install via DENO_INSTALL=/usr/local.
+if ! command -v deno >/dev/null 2>&1; then
+  curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
+fi
+deno --version
+
 echo "==> 2) App dir & virtualenv"
 mkdir -p "${APP_DIR}"
 python3 -m venv "${VENV_DIR}"
 source "${VENV_DIR}/bin/activate"
 pip install --upgrade pip
-pip install "ytp-dl==0.4.3" gunicorn gevent
+pip install "ytp-dl==0.6.3" "yt-dlp[default]" gunicorn gevent
 deactivate
 
 echo "==> 3) API environment file (/etc/default/ytp-dl-api)"
@@ -294,19 +315,7 @@ echo "==> 5) Start and enable API service"
 systemctl daemon-reload
 systemctl enable --now ytp-dl-api.service
 
-echo "==> 6) Auto-reboot cron (/etc/cron.d/ytp-dl-auto-reboot)"
-if [[ -n "${AUTO_REBOOT_CRON}" ]]; then
-  REBOOT_BIN="$(command -v reboot || echo /sbin/reboot)"
-  tee /etc/cron.d/ytp-dl-auto-reboot >/dev/null <<EOF
-${AUTO_REBOOT_CRON} root ${REBOOT_BIN}
-EOF
-  chmod 644 /etc/cron.d/ytp-dl-auto-reboot
-  systemctl restart cron || true
-else
-  echo "AUTO_REBOOT_CRON empty; skipping auto-reboot setup."
-fi
-
-echo "==> 7) Quick status + health check"
+echo "==> 6) Quick status + health check"
 systemctl status ytp-dl-api --no-pager || true
 
 echo
