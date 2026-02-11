@@ -6,7 +6,8 @@ import shlex
 import shutil
 import subprocess
 import time
-from typing import Optional, List, Tuple
+from collections import deque
+from typing import Callable, Deque, List, Optional, Tuple
 
 # =========================
 # Config / constants
@@ -58,11 +59,6 @@ def _tail(out: str) -> str:
     if len(txt) > _MAX_ERR_CHARS:
         txt = txt[-_MAX_ERR_CHARS:]
     return txt.strip()
-
-
-def _is_youtube_url(url: str) -> bool:
-    u = (url or "").lower()
-    return any(h in u for h in ("youtube.com", "youtu.be", "youtube-nocookie.com"))
 
 
 # =========================
@@ -123,24 +119,29 @@ def mullvad_wait_connected(timeout: int = 20) -> bool:
 
 
 # =========================
-# yt-dlp helpers
+# yt-dlp helpers (streaming-only)
 # =========================
 def _common_flags() -> List[str]:
     # --no-playlist prevents accidental channel/playlist pulls (and disk blowups)
     return [
         "--no-playlist",
-        "--retries", "10",
-        "--fragment-retries", "10",
-        "--retry-sleep", "exp=1:30",
-        "--user-agent", MODERN_UA,
+        "--retries",
+        "10",
+        "--fragment-retries",
+        "10",
+        "--retry-sleep",
+        "exp=1:30",
+        "--user-agent",
+        MODERN_UA,
         "--no-cache-dir",
         "--ignore-config",
         "--embed-metadata",
-        "--sleep-interval", "1",
+        "--sleep-interval",
+        "1",
     ]
 
 
-def _extract_final_path(stdout: str, out_dir: str) -> Optional[str]:
+def _extract_final_path_from_tail(stdout: str, out_dir: str) -> Optional[str]:
     """
     Robustly derive the final output file path from yt-dlp output.
 
@@ -163,15 +164,14 @@ def _extract_final_path(stdout: str, out_dir: str) -> Optional[str]:
             candidates.append(line.strip("'\""))
             continue
 
-        # 2) Merger line: ... into "path"
+        # 2) Merger line
         if "Merging formats into" in line and "\"" in line:
             try:
                 merged = line.split("Merging formats into", 1)[1].strip()
                 if merged.startswith("\"") and merged.endswith("\""):
                     merged = merged[1:-1]
-                else:
-                    if merged.startswith("\""):
-                        merged = merged.split("\"", 2)[1]
+                elif merged.startswith("\""):
+                    merged = merged.split("\"", 2)[1]
                 if merged:
                     if not os.path.isabs(merged):
                         merged = os.path.join(out_dir, merged)
@@ -180,7 +180,7 @@ def _extract_final_path(stdout: str, out_dir: str) -> Optional[str]:
                 pass
             continue
 
-        # 3) Destination lines (download/extractaudio)
+        # 3) Destination lines
         if "Destination:" in line:
             try:
                 p = line.split("Destination:", 1)[1].strip().strip("'\"")
@@ -208,10 +208,9 @@ def _extract_final_path(stdout: str, out_dir: str) -> Optional[str]:
             except Exception:
                 pass
 
-    # Prefer existing, newest candidate (reverse traversal)
     for p in reversed(candidates):
         if p and os.path.exists(p):
-            return p
+            return os.path.abspath(p)
 
     # 4) Fallback: newest non-temp file in out_dir
     try:
@@ -228,54 +227,148 @@ def _extract_final_path(stdout: str, out_dir: str) -> Optional[str]:
                 best_mtime = mt
                 best_path = full
         if best_path:
-            return best_path
+            return os.path.abspath(best_path)
     except Exception:
         pass
 
     return None
 
 
-def _download_with_format(
+def _build_ytdlp_argv(
+    *,
     url: str,
     out_dir: str,
     fmt: str,
-    merge_output_format: Optional[str] = None,
-    extract_mp3: bool = False,
-) -> str:
+    merge_output_format: Optional[str],
+    extract_mp3: bool,
+) -> List[str]:
     out_dir = os.path.abspath(out_dir)
-    os.makedirs(out_dir, exist_ok=True)
-
     out_tpl = os.path.join(out_dir, "%(title)s.%(ext)s")
 
     argv = [
         YTDLP_BIN,
-        "-f", fmt,
+        "-f",
+        fmt,
         *(_common_flags()),
-        "--output", out_tpl,
+        "--output",
+        out_tpl,
         # Ensure we can reliably pick the final output path.
-        "--print", "after_move:filepath",
+        "--print",
+        "after_move:filepath",
+        # Critical for real-time streaming to SSE when stdout is piped:
+        "--progress",
+        "--newline",
+        "--no-color",
     ]
 
     if extract_mp3:
-        # Force audio extraction to MP3 (requires ffmpeg)
         argv.extend(["--extract-audio", "--audio-format", "mp3"])
 
-    # Only force merge container when we actually want MP4 output.
     if merge_output_format:
         argv.extend(["--merge-output-format", merge_output_format])
 
     argv.append(url)
+    return argv
 
-    rc, out = _run_argv_capture(argv)
-    path = _extract_final_path(out, out_dir)
 
-    if path and os.path.exists(path):
-        return os.path.abspath(path)
+def _download_with_format_stream(
+    *,
+    url: str,
+    out_dir: str,
+    fmt: str,
+    merge_output_format: Optional[str],
+    extract_mp3: bool,
+    on_line: Callable[[str], None],
+) -> str:
+    """Run yt-dlp, emit output lines via on_line(), return final output file path."""
+    out_dir = os.path.abspath(out_dir)
+    os.makedirs(out_dir, exist_ok=True)
 
-    tail = _tail(out)
+    argv = _build_ytdlp_argv(
+        url=url,
+        out_dir=out_dir,
+        fmt=fmt,
+        merge_output_format=merge_output_format,
+        extract_mp3=extract_mp3,
+    )
+
+    tail_lines: Deque[str] = deque(maxlen=_MAX_ERR_LINES)
+    candidates: List[str] = []
+
+    def _maybe_add_candidate(p: str) -> None:
+        p = (p or "").strip().strip("'\"")
+        if not p:
+            return
+        if not os.path.isabs(p):
+            p = os.path.join(out_dir, p)
+        candidates.append(p)
+
+    proc = subprocess.Popen(
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+
+    assert proc.stdout is not None
+
+    try:
+        for line in proc.stdout:
+            s = (line or "").rstrip("\n")
+            if not s:
+                continue
+
+            on_line(s)
+            tail_lines.append(s)
+
+            # 1) after_move:filepath (absolute path)
+            if os.path.isabs(s) and s.startswith(out_dir):
+                _maybe_add_candidate(s)
+
+            # 2) Merger line
+            if "Merging formats into" in s and "\"" in s:
+                try:
+                    merged = s.split("Merging formats into", 1)[1].strip()
+                    if merged.startswith("\"") and merged.endswith("\""):
+                        merged = merged[1:-1]
+                    elif merged.startswith("\""):
+                        merged = merged.split("\"", 2)[1]
+                    _maybe_add_candidate(merged)
+                except Exception:
+                    pass
+
+            # 3) Destination line
+            if "Destination:" in s:
+                try:
+                    p = s.split("Destination:", 1)[1].strip()
+                    _maybe_add_candidate(p)
+                except Exception:
+                    pass
+
+        rc = proc.wait()
+    finally:
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+
+    # Prefer existing, newest candidate (reverse traversal)
+    for p in reversed(candidates):
+        if p and os.path.exists(p):
+            return os.path.abspath(p)
+
+    # Fallback: parse tail, then scan dir
+    tail_txt = "\n".join(tail_lines)
+    final_path = _extract_final_path_from_tail(tail_txt, out_dir)
+    if final_path and os.path.exists(final_path):
+        return os.path.abspath(final_path)
+
     if rc != 0:
-        raise RuntimeError(f"yt-dlp failed (format: {fmt})\n{tail}")
-    raise RuntimeError(f"Download completed but output file not found (format: {fmt})\n{tail}")
+        raise RuntimeError(f"yt-dlp failed (format: {fmt})\n{_tail(tail_txt)}")
+    raise RuntimeError(
+        f"Download completed but output file not found (format: {fmt})\n{_tail(tail_txt)}"
+    )
 
 
 def _fmt_mp4_apple_safe(cap: int) -> str:
@@ -293,14 +386,22 @@ def _fmt_best(cap: int) -> str:
 
 
 # =========================
-# Public API
+# Public API (streaming-only)
 # =========================
 def download_video(
+    *,
     url: str,
     resolution: int | None = 1080,
     extension: Optional[str] = None,
     out_dir: str = DEFAULT_OUT_DIR,
+    on_line: Callable[[str], None],
 ) -> str:
+    """
+    Streaming-only downloader.
+    - Always runs yt-dlp with line-based progress output.
+    - Emits raw yt-dlp stdout lines through on_line().
+    - Returns the final output file path.
+    """
     if not url:
         raise RuntimeError("Missing URL")
 
@@ -316,46 +417,46 @@ def download_video(
 
     try:
         mode = (extension or "mp4").lower().strip()
+        cap = int(resolution or 1080)
 
         if mode == "mp3":
-            # bestaudio -> ffmpeg -> mp3 (post-processed by yt-dlp)
-            return _download_with_format(
+            return _download_with_format_stream(
                 url=url,
                 out_dir=out_dir,
                 fmt="bestaudio",
                 merge_output_format=None,
                 extract_mp3=True,
+                on_line=on_line,
             )
 
-        cap = int(resolution or 1080)
-
         if mode == "best":
-            # Try best first (may produce webm/mkv/etc).
             try:
-                return _download_with_format(
+                return _download_with_format_stream(
                     url=url,
                     out_dir=out_dir,
                     fmt=_fmt_best(cap),
                     merge_output_format=None,
                     extract_mp3=False,
+                    on_line=on_line,
                 )
             except Exception:
-                # If best fails for any reason, fall back to Apple-safe MP4.
-                return _download_with_format(
+                return _download_with_format_stream(
                     url=url,
                     out_dir=out_dir,
                     fmt=_fmt_mp4_apple_safe(cap),
                     merge_output_format="mp4",
                     extract_mp3=False,
+                    on_line=on_line,
                 )
 
         # Default / "mp4" mode: force Apple-safe MP4 up to cap.
-        return _download_with_format(
+        return _download_with_format_stream(
             url=url,
             out_dir=out_dir,
             fmt=_fmt_mp4_apple_safe(cap),
             merge_output_format="mp4",
             extract_mp3=False,
+            on_line=on_line,
         )
 
     finally:
