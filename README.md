@@ -1,58 +1,69 @@
 # ytp-dl
 
-A lightweight YouTube downloader with Mullvad VPN integration and a streaming HTTP API.
-
 [![PyPI version](https://img.shields.io/pypi/v/ytp-dl.svg)](https://pypi.org/project/ytp-dl/)
 [![Python Support](https://img.shields.io/pypi/pyversions/ytp-dl.svg)](https://pypi.org/project/ytp-dl/)
 [![License](https://img.shields.io/pypi/l/ytp-dl.svg)](https://pypi.org/project/ytp-dl/)
 [![Downloads](https://img.shields.io/pypi/dm/ytp-dl.svg)](https://pypi.org/project/ytp-dl/)
 
-**ytp-dl** is a privacy-focused YouTube downloader that routes downloads through Mullvad VPN via an HTTP API.
+Privacy-focused media downloader API for Linux VPS deployments — powered by yt-dlp, routed through Mullvad VPN, with real-time SSE log streaming.
 
 ---
 
 ## Features
 
-* Privacy-first: connect/disconnect Mullvad per download
-* Smart quality selection: prefers 1080p H.264 + AAC (no transcoding)
-* Audio downloads: extract audio as MP3
-* Streaming HTTP API:
-  * `POST /api/download` streams real-time yt-dlp output as Server-Sent Events (SSE)
-  * `GET  /api/fetch/<job_id>` fetches the finished file
-* Stable public API under VPN cycling: exclude the API port from the tunnel (nftables marks) + policy routing
-* VPS-ready: automated installer script for Ubuntu
+- Privacy-first: connect/disconnect Mullvad per download
+- Smart quality selection: prefers 1080p H.264 + AAC (no transcoding)
+- Best format mode: let yt-dlp pick the highest quality available (adaptive, no transcoding)
+- Audio extraction: downloads best audio stream as MP3 with embedded cover art and metadata (re-encodes only when the source isn't already MP3)
+- Playlist support: YouTube playlists, SoundCloud sets, Bilibili series, Odysee playlists — downloads all tracks, produces a concatenated media file and a ZIP of individual tracks
+- Streaming HTTP API:
+  - `POST /api/download` streams real-time yt-dlp output as Server-Sent Events (SSE)
+  - `GET  /api/fetch/<job_id>` fetches the finished file
+  - `GET  /api/fetch/<job_id>/<filename>` fetches a specific file from a job by name
+- Optional R2 upload: upload completed files to Cloudflare R2 and emit `data: [r2] key=<object_key>`
+- Stable public API under VPN cycling: exclude the API port from the tunnel (nftables marks) + policy routing
+- VPS-ready: automated installer script for Ubuntu
 
 ---
 
 ## Installation
 
 ```bash
-pip install ytp-dl==0.9.8 yt-dlp[default]
+pip install ytp-dl==2026.4.10.2 yt-dlp[default]
 ```
 
-Requirements:
+### Requirements
 
-* Linux (tested on Ubuntu 24.04/25.04)
-* Mullvad CLI installed and configured
-* FFmpeg (audio/video handling)
-* Deno (system-wide; required by yt-dlp for modern YouTube extraction)
-* Python 3.8+
+- Linux (tested on Ubuntu 24.04/25.04)
+- Mullvad CLI installed and configured
+- FFmpeg (audio/video handling)
+- Deno (system-wide; required by yt-dlp for modern YouTube extraction)
+- Python 3.8+
 
 Notes:
-
-* yt-dlp expects **Deno** to be available on `PATH` to run its JavaScript-based extraction logic.
+- yt-dlp expects **Deno** to be available on `PATH` to run its JavaScript-based extraction logic.
 
 ---
 
-## Using your VPS
+## Quick start
 
 A download is a **two-phase** flow:
 
 1) Start the job and stream logs:
-   `POST /api/download` (SSE)
+- `POST /api/download` (SSE)
 
 2) Fetch the finished file:
-   `GET /api/fetch/<job_id>`
+- `GET /api/fetch/<job_id>`
+
+### Start a best-quality download
+
+```bash
+curl -N --http1.1 \
+  -H "Accept: text/event-stream" \
+  -H "Content-Type: application/json" \
+  -X POST "http://YOUR_VPS_IP:5000/api/download" \
+  --data-binary '{"url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ","extension":"best","job_id":"demo3"}'
+```
 
 ### Start a video download (1080p MP4)
 
@@ -76,6 +87,7 @@ curl -N --http1.1 \
   --data-binary '{"url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ","extension":"mp3","job_id":"demo2"}'
 ```
 
+
 ### Fetch the finished file
 
 When the SSE stream emits a line like:
@@ -90,7 +102,7 @@ Fetch the file using the same `job_id`:
 curl -L -O -J "http://YOUR_VPS_IP:5000/api/fetch/demo1"
 ```
 
-* `-O -J` tells curl to use the filename from `Content-Disposition`.
+- `-O -J` tells curl to use the filename from `Content-Disposition`.
 
 ### Windows (CMD.exe) examples
 
@@ -104,23 +116,68 @@ curl -N --http1.1 ^
   --data-binary "{\"url\":\"https://www.youtube.com/watch?v=dQw4w9WgXcQ\",\"extension\":\"mp4\",\"resolution\":1080,\"job_id\":\"demo1\"}"
 ```
 
+Note: PowerShell handles JSON escaping differently — wrap the `--data-binary` value in single quotes and use standard double quotes inside.
+
 Fetch the finished file:
 
 ```bat
 curl -L -O -J "http://YOUR_VPS_IP:5000/api/fetch/demo1"
 ```
 
-### Using from Python
+---
 
-This example streams logs from `POST /api/download` (SSE), then downloads the finished file from `GET /api/fetch/<job_id>`.
+## Python client
 
-Install the client dependency:
+A minimal Python script that replicates the two-phase download flow (SSE stream → fetch) and handles server-side errors with retries and playlist resume.
+
+### Installation
 
 ```bash
 pip install requests
 ```
 
-Save this as `ytp-dl.py`:
+Save the script below as `ytp-dl.py`.
+
+### Usage
+
+```bash
+# Single video — MP4
+python3 ytp-dl.py --base "http://YOUR_VPS_IP:5000" --url "https://www.youtube.com/watch?v=dQw4w9WgXcQ" --extension best --resolution 1080 --out-dir .
+
+# Audio — MP3
+python3 ytp-dl.py --base "http://YOUR_VPS_IP:5000" --url "https://soundcloud.com/artist/track" --extension mp3 --out-dir .
+
+# Playlist with retries
+python3 ytp-dl.py --base "http://YOUR_VPS_IP:5000" --url "https://www.youtube.com/playlist?list=PLxxx" --extension mp4 --out-dir .
+```
+
+Set `YTPDL_BASE` in your environment to avoid passing `--base` every time:
+
+```bash
+export YTPDL_BASE="http://YOUR_VPS_IP:5000"
+python3 ytp-dl.py --url "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+```
+
+### Arguments
+
+| Argument | Default | Description |
+|---|---|---|
+| `--base` | `$YTPDL_BASE` or `http://127.0.0.1:5000` | VPS base URL |
+| `--url` | *(required)* | Media URL to download |
+| `--extension` | `mp4` | `mp4`, `mp3`, or `best` |
+| `--resolution` | `1080` | Max height cap (ignored for `mp3`) |
+| `--out-dir` | `.` | Directory to save the file |
+| `--max-retries` | `5` | Retries on server-side error, e.g. rate-limit |
+| `--retry-delay` | `1` | Seconds before first retry; doubles each attempt (max 60s) |
+| `--retry-factor` | `2` | Backoff multiplier applied after each retry |
+| `--connect-timeout` | `15` | Connection timeout in seconds |
+| `--read-timeout` | `300` | Read timeout in seconds |
+
+### Retry behavior
+
+On any server-side error (rate-limit, VPN cycle, etc.), the script retries automatically up to `--max-retries` times with exponential backoff (`--retry-delay` × `--retry-factor` each attempt, capped at 60s). It reuses the same `job_id` on each attempt — for playlist downloads, the VPS `.ytdlp-archive` skips already-completed tracks so nothing is re-downloaded.
+
+### Script
 
 ```python
 #!/usr/bin/env python3
@@ -130,6 +187,9 @@ ytp-dl Python client (SSE + fetch)
 Flow:
   1) POST /api/download         -> streams yt-dlp logs as Server-Sent Events (SSE)
   2) GET  /api/fetch/<job_id>   -> downloads the finished file
+
+On rate-limit ([error] from server), re-POSTs with the same job_id so the
+VPS .ytdlp-archive skips already-downloaded tracks (playlist resume).
 
 Requirements:
   pip install requests
@@ -141,6 +201,7 @@ import argparse
 import os
 import re
 import sys
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Optional
@@ -149,8 +210,20 @@ from urllib.parse import unquote
 import requests
 
 
-_FETCH_RX = re.compile(r"(/api/fetch/[A-Za-z0-9_\-]+)")
+_FETCH_RX    = re.compile(r"(/api/fetch/[A-Za-z0-9_\-]+)")
 _START_JOB_RX = re.compile(r"\[start\]\s+job_id=([A-Za-z0-9_\-]+)")
+
+# Lines that are internal protocol signals — suppress from printed output.
+_SUPPRESS_PREFIXES = (
+    "[playlist_count] ",
+    "[playlist_title] ",
+    "[zip_file] ",
+    "[zip_fetch] ",
+    "[zip_download] ",
+    "[r2_upload] ",
+    "[ready] ",
+    "[file] ",
+)
 
 
 @dataclass(frozen=True)
@@ -163,6 +236,9 @@ class Config:
     out_dir: str
     connect_timeout_s: float
     read_timeout_s: float
+    max_retries: int
+    retry_delay_s: float
+    retry_factor: float
 
 
 def _normalize_base(base: str) -> str:
@@ -183,11 +259,6 @@ def _parse_job_id(msg: str) -> Optional[str]:
 
 
 def _filename_from_content_disposition(cd: str) -> Optional[str]:
-    """
-    Minimal RFC 6266 handling:
-      - filename*=UTF-8''... (percent-encoded)
-      - filename="..."
-    """
     cd = (cd or "").strip()
     if not cd:
         return None
@@ -220,13 +291,17 @@ def _safe_default_filename(ext: str) -> str:
 
 
 def _auto_job_id() -> str:
-    # Stable enough for fetch, small enough for URLs; allowed chars: [A-Za-z0-9_-]
     return f"job_{uuid.uuid4().hex[:12]}"
 
 
-def stream_logs_and_get_fetch_path(cfg: Config) -> tuple[Optional[str], str]:
+def stream_logs_and_get_fetch_path(
+    cfg: Config,
+) -> tuple[Optional[str], str, Optional[str]]:
     """
-    Streams SSE logs, prints them, and returns (fetch_path, resolved_job_id).
+    Stream SSE logs from the VPS download endpoint.
+
+    Returns (fetch_path, resolved_job_id, error_msg).
+    error_msg is non-None when the server emitted [error].
     """
     payload: dict = {"url": cfg.url, "extension": cfg.extension, "job_id": cfg.job_id}
     if cfg.resolution is not None:
@@ -236,6 +311,7 @@ def stream_logs_and_get_fetch_path(cfg: Config) -> tuple[Optional[str], str]:
 
     fetch_path: Optional[str] = None
     resolved_job_id: str = cfg.job_id
+    error_msg: Optional[str] = None
 
     with requests.post(
         f"{cfg.base}/api/download",
@@ -250,14 +326,8 @@ def stream_logs_and_get_fetch_path(cfg: Config) -> tuple[Optional[str], str]:
             if raw is None:
                 continue
             line = (raw or "").strip("\r")
-            if not line:
+            if not line or line.startswith(":"):
                 continue
-
-            # Ignore SSE comment keep-alives: ": keep-alive"
-            if line.startswith(":"):
-                continue
-
-            # Only consume "data:" events
             if not line.startswith("data:"):
                 continue
 
@@ -265,27 +335,37 @@ def stream_logs_and_get_fetch_path(cfg: Config) -> tuple[Optional[str], str]:
             if not msg:
                 continue
 
-            print(msg, flush=True)
-
-            # In case server normalizes/overrides the job id, capture it.
+            # Capture job id from [start] event.
             jid = _parse_job_id(msg)
             if jid:
                 resolved_job_id = jid
 
-            # Capture fetch hint once
+            # Capture fetch hint.
             if not fetch_path:
                 fp = _parse_fetch_path(msg)
                 if fp:
                     fetch_path = fp
 
-    return fetch_path, resolved_job_id
+            # Detect server-side error.
+            if msg.startswith("[error]"):
+                error_msg = msg[len("[error]"):].strip()
+                print(msg, flush=True)
+                continue
+
+            # Suppress internal protocol events from output.
+            if any(msg.startswith(p) for p in _SUPPRESS_PREFIXES):
+                continue
+
+            # Suppress [done] — protocol signal only.
+            if msg.startswith("[done]") or msg == "All downloads complete.":
+                continue
+
+            print(msg, flush=True)
+
+    return fetch_path, resolved_job_id, error_msg
 
 
 def fetch_file(cfg: Config, fetch_path: str) -> str:
-    """
-    Downloads the file from fetch_path, respecting Content-Disposition filename when present.
-    Returns absolute path to saved file.
-    """
     os.makedirs(cfg.out_dir, exist_ok=True)
 
     with requests.get(
@@ -300,7 +380,6 @@ def fetch_file(cfg: Config, fetch_path: str) -> str:
         filename = _filename_from_content_disposition(cd) or _safe_default_filename(cfg.extension)
         out_path = os.path.abspath(os.path.join(cfg.out_dir, filename))
 
-        # Avoid accidental overwrite
         if os.path.exists(out_path):
             base, ext = os.path.splitext(out_path)
             i = 1
@@ -308,9 +387,8 @@ def fetch_file(cfg: Config, fetch_path: str) -> str:
                 i += 1
             out_path = f"{base}_{i}{ext}"
 
-        chunk_size = 1024 * 128
         with open(out_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=chunk_size):
+            for chunk in r.iter_content(chunk_size=1024 * 128):
                 if chunk:
                     f.write(chunk)
 
@@ -325,11 +403,19 @@ def parse_args(argv: list[str]) -> Config:
         help="Base URL, e.g. http://YOUR_VPS_IP:5000 (env: YTPDL_BASE)",
     )
     p.add_argument("--url", required=True, help="Media URL to download")
-    p.add_argument("--extension", default="mp4", choices=["mp4", "mp3", "best"], help="Download mode")
-    p.add_argument("--resolution", type=int, default=1080, help="Max height cap (default: 1080)")
+    p.add_argument("--extension", default="mp4", choices=["mp4", "mp3", "best"],
+                   help="Download mode")
+    p.add_argument("--resolution", type=int, default=1080,
+                   help="Max height cap (default: 1080)")
     p.add_argument("--out-dir", default=".", help="Directory to save the fetched file")
-    p.add_argument("--connect-timeout", type=float, default=15.0, help="Connect timeout seconds")
-    p.add_argument("--read-timeout", type=float, default=300.0, help="Read timeout seconds")
+    p.add_argument("--connect-timeout", type=float, default=15.0)
+    p.add_argument("--read-timeout", type=float, default=300.0)
+    p.add_argument("--max-retries", type=int, default=5,
+                   help="Max retries on server-side error, e.g. rate-limit (default: 5)")
+    p.add_argument("--retry-delay", type=float, default=1.0,
+                   help="Seconds before first retry; doubles each attempt (default: 1)")
+    p.add_argument("--retry-factor", type=float, default=2.0,
+                   help="Backoff multiplier applied after each retry (default: 2)")
 
     a = p.parse_args(argv)
 
@@ -342,20 +428,50 @@ def parse_args(argv: list[str]) -> Config:
         out_dir=a.out_dir,
         connect_timeout_s=a.connect_timeout,
         read_timeout_s=a.read_timeout,
+        max_retries=a.max_retries,
+        retry_delay_s=a.retry_delay,
+        retry_factor=a.retry_factor,
     )
 
 
 def main(argv: list[str]) -> int:
     cfg = parse_args(argv)
 
-    try:
-        fetch_path, resolved_job_id = stream_logs_and_get_fetch_path(cfg)
-    except requests.RequestException as e:
-        print(f"ERROR: Request failed: {e}", file=sys.stderr)
-        return 1
+    attempt = 0
+    delay   = cfg.retry_delay_s
+
+    while True:
+        attempt += 1
+
+        try:
+            fetch_path, resolved_job_id, error_msg = stream_logs_and_get_fetch_path(cfg)
+        except requests.RequestException as e:
+            print(f"ERROR: Request failed: {e}", file=sys.stderr)
+            return 1
+
+        # Success path — no server error.
+        if error_msg is None:
+            break
+
+        # Server signalled an error (rate-limit, VPN cycle needed, etc.)
+        if attempt >= cfg.max_retries:
+            print(
+                f"ERROR: Server error after {attempt} attempt(s): {error_msg}",
+                file=sys.stderr,
+            )
+            return 1
+
+        print(
+            f"[retry] Attempt {attempt}/{cfg.max_retries} failed: {error_msg}",
+            file=sys.stderr,
+        )
+        print(f"[retry] Retrying in {delay:.0f}s...", file=sys.stderr)
+        time.sleep(delay)
+        delay = min(delay * cfg.retry_factor, 60.0)   # exponential backoff, cap at 60s
+
+        # Keep the same job_id so the VPS .ytdlp-archive resumes the playlist.
 
     if not fetch_path:
-        # Fallback: predictable fetch path when job_id is known
         fetch_path = f"/api/fetch/{resolved_job_id}"
 
     try:
@@ -370,75 +486,54 @@ def main(argv: list[str]) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
+
 ```
-
-Run it:
-
-macOS / Linux
-
-```bash
-python3 ytp-dl.py \
-  --base "http://YOUR_VPS_IP:5000" \
-  --url "https://www.youtube.com/watch?v=dQw4w9WgXcQ" \
-  --extension mp4 \
-  --resolution 1080 \
-  --out-dir .
-```
-
-Windows (CMD)
-
-```bat
-py ytp-dl.py ^
-  --base "http://YOUR_VPS_IP:5000" ^
-  --url "https://www.youtube.com/watch?v=dQw4w9WgXcQ" ^
-  --extension mp4 ^
-  --resolution 1080 ^
-  --out-dir .
-```
-
-Notes:
-
-* The client auto-generates a `job_id` and uses it internally.
-* If you omit `--base`, it uses `YTPDL_BASE` (or defaults to `http://127.0.0.1:5000`).
 
 ---
 
 ## Configuration
 
-### Installation script variables
+Runtime config lives in `/etc/default/ytp-dl-api` (the installer creates it). Edit the file and restart the service to apply changes.
 
-These environment variables configure the VPS installation (you can override them when running the script).
+### Installer-only variables
 
-| Variable                 | Description                             | Default               |
-| ------------------------ | --------------------------------------- | --------------------- |
-| `PORT`                   | API server port                         | `5000`                |
-| `APP_DIR`                | Installation directory                  | `/opt/yt-dlp-mullvad` |
-| `MV_ACCOUNT`             | Mullvad account number                  | (empty)               |
-| `YTPDL_MAX_CONCURRENT`   | Max simultaneous downloads (API cap)    | `1`                   |
-| `YTPDL_MULLVAD_LOCATION` | Mullvad relay location code (e.g. `us`) | `us`                  |
-| `GUNICORN_THREADS`       | Threads per Gunicorn worker             | `4`                   |
+| Variable | Description | Default |
+|---|---|---:|
+| `PORT` | API server port | `5000` |
+| `APP_DIR` | Installation directory | `/opt/yt-dlp-mullvad` |
+| `MV_ACCOUNT` | Mullvad account number (optional; one-time login) | *(empty)* |
 
-Notes:
+### Runtime variables
 
-* If `MV_ACCOUNT` is set, the installer attempts `mullvad account login <MV_ACCOUNT>` once.
-* If `MV_ACCOUNT` is left empty, the script skips login and assumes Mullvad is already configured.
+These are read from `/etc/default/ytp-dl-api`. You can also export any of them before running the installer to pre-seed that file.
 
-### Runtime environment variables
+| Variable | Description | Default |
+|---|---|---:|
+| `YTPDL_VENV` | Path to virtualenv for ytp-dl | `/opt/yt-dlp-mullvad/venv` |
+| `YTPDL_MULLVAD_LOCATION` | Mullvad relay location code | `us` |
+| `YTPDL_MAX_CONCURRENT` | Maximum concurrent download jobs | `1` |
+| `YTPDL_DONE_TTL_S` | Seconds to keep a completed single-file job dir before deletion | `300` |
+| `YTPDL_PLAYLIST_DONE_TTL_S` | Seconds to keep a completed playlist job dir before deletion (longer to allow fetching both output files) | `600` |
+| `YTPDL_STALE_JOB_TTL_S` | Seconds before an unfinished/unfetched job dir is force-deleted | `3600` |
+| `YTPDL_JOB_TIMEOUT_S` | Hard kill timeout for a single-file yt-dlp process | `1800` |
+| `YTPDL_PLAYLIST_JOB_TIMEOUT_S` | Hard kill timeout for a playlist yt-dlp process | `21600` |
+| `GUNICORN_WORKERS` | Gunicorn worker processes | `1` |
+| `GUNICORN_THREADS` | Threads per Gunicorn worker | `4` |
+| `YTPDL_R2_UPLOAD` | Upload completed files to R2 | `0` |
+| `R2_ENDPOINT` | R2 endpoint (no bucket suffix) | *(empty)* |
+| `R2_BUCKET` | R2 bucket name | *(empty)* |
+| `R2_ACCESS_KEY_ID` | R2 uploader access key id | *(empty)* |
+| `R2_SECRET_ACCESS_KEY` | R2 uploader secret access key | *(empty)* |
+| `AWS_EC2_METADATA_DISABLED` | Disable EC2 metadata fetch | `true` |
 
-After installation, these are set in `/etc/default/ytp-dl-api` and can be edited manually.
-
-| Variable                 | Description                   | Default                    |
-| ------------------------ | ----------------------------- | -------------------------- |
-| `YTPDL_MAX_CONCURRENT`   | Maximum concurrent downloads  | `1`                        |
-| `YTPDL_MULLVAD_LOCATION` | Mullvad relay location code   | `us`                       |
-| `YTPDL_VENV`             | Path to virtualenv for ytp-dl | `/opt/yt-dlp-mullvad/venv` |
-
-To change configuration after installation:
+To change runtime configuration:
 
 ```bash
 sudo nano /etc/default/ytp-dl-api
 sudo systemctl restart ytp-dl-api
 ```
+
+Keep secrets (e.g. `R2_SECRET_ACCESS_KEY`) on the server only — do not commit them to repos or READMEs.
 
 ---
 
@@ -456,7 +551,7 @@ sudo systemctl start ytp-dl-api
 
 ## API reference
 
-### POST `/api/download` (SSE logs)
+### `POST /api/download` (SSE logs)
 
 Request body:
 
@@ -464,27 +559,43 @@ Request body:
 {
   "url": "string (required)",
   "resolution": "integer (optional, default: 1080)",
-  "extension": "string (optional, 'mp4', 'mp3', or 'best')",
+  "extension": "string (optional: 'mp4', 'mp3', or 'best')",
   "job_id": "string (optional, recommended for fetch; [A-Za-z0-9_-])"
 }
 ```
 
-Response:
+- `mp4` — 1080p H.264 + AAC, no transcoding
+- `mp3` — best audio stream, output as MP3 with embedded cover art and metadata
+- `best` — yt-dlp selects the highest quality adaptive format; `resolution` is ignored
 
-* `200 OK` - SSE stream (`text/event-stream`) containing yt-dlp output lines and a fetch hint:
-  * `data: [start] job_id=<job_id>`
-  * `data: [ready] job_id=<job_id>`
-  * `data: [fetch] /api/fetch/<job_id>`
-  * `data: [done]`
-* `400 Bad Request` - Missing or invalid URL/params
-* `500 Internal Server Error` - Download failed
-* `503 Service Unavailable` - Server busy (max concurrent downloads reached)
+Response — `200 OK` SSE stream (`text/event-stream`):
 
-### GET `/api/fetch/<job_id>`
+```
+data: [start] job_id=<job_id>
+data: <yt-dlp output lines>
+data: [zip_file] <zip filename>       # playlist only — ZIP available on VPS
+data: [ready] job_id=<job_id>
+data: [file] <filename>
+data: [r2_upload] XX.XX%              # if R2 enabled on VPS
+data: [r2] key=<object_key>           # if R2 enabled on VPS
+data: [zip_download] <zip filename>   # playlist only — ZIP uploaded to R2
+data: [fetch] /api/fetch/<job_id>
+data: [done]
+```
 
-Returns the finished file as an attachment. The job directory is cleaned up after the response completes.
+Other responses:
+- `400 Bad Request` — missing or invalid URL/params
+- `503 Service Unavailable` — server busy (max concurrent downloads reached)
 
-### GET `/healthz`
+### `GET /api/fetch/<job_id>`
+
+Returns the finished file as an attachment. The job directory is cleaned up after the response completes (or after `YTPDL_DONE_TTL_S` / `YTPDL_PLAYLIST_DONE_TTL_S` elapses).
+
+### `GET /api/fetch/<job_id>/<filename>`
+
+Returns a specific file from the job directory by name. Useful for fetching any secondary output files produced by a job (e.g. the ZIP of individual playlist tracks).
+
+### `GET /healthz`
 
 ```json
 {
@@ -517,7 +628,8 @@ It also installs all runtime dependencies and configures the API as a managed sy
 #   - Configures policy routing so the public API stays reachable while Mullvad toggles
 #   - Adds Mullvad excluded-port rules (nftables marks) so :PORT stays reachable under VPN
 #   - Creates a virtualenv at /opt/yt-dlp-mullvad/venv
-#   - Installs ytp-dl==0.9.8 + yt-dlp[default] + gunicorn in that venv
+#   - Installs ytp-dl + yt-dlp[default] + gunicorn (+ boto3 if R2 upload enabled)
+#   - (Optional) bakes in Cloudflare R2 uploader env vars
 #   - Creates a systemd service ytp-dl-api.service on port 5000
 #
 # Mullvad connect/disconnect is handled per-job by downloader.py.
@@ -529,10 +641,19 @@ PORT="${PORT:-5000}"                           # API listen port
 APP_DIR="${APP_DIR:-/opt/yt-dlp-mullvad}"      # app/venv root
 VENV_DIR="${VENV_DIR:-${APP_DIR}/venv}"        # python venv
 
-MV_ACCOUNT="${MV_ACCOUNT:-}"                   # Mullvad account (optional)
-YTPDL_MAX_CONCURRENT="${YTPDL_MAX_CONCURRENT:-1}"        # API concurrency cap
-YTPDL_MULLVAD_LOCATION="${YTPDL_MULLVAD_LOCATION:-us}"   # default Mullvad relay hint
-GUNICORN_THREADS="${GUNICORN_THREADS:-4}"               # keep API responsive on small VPS
+MV_ACCOUNT="${MV_ACCOUNT:-}"                            # Mullvad account (optional)
+YTPDL_MAX_CONCURRENT="${YTPDL_MAX_CONCURRENT:-1}"       # API concurrency cap (download jobs)
+YTPDL_MULLVAD_LOCATION="${YTPDL_MULLVAD_LOCATION:-us}"  # default Mullvad relay hint
+GUNICORN_WORKERS="${GUNICORN_WORKERS:-1}"               # Gunicorn worker processes
+GUNICORN_THREADS="${GUNICORN_THREADS:-4}"               # Threads per Gunicorn worker
+
+# --- Optional R2 upload (Cloudflare R2 / S3-compatible) ----------------------
+YTPDL_R2_UPLOAD="${YTPDL_R2_UPLOAD:-0}"                 # 1 to enable upload
+R2_ENDPOINT="${R2_ENDPOINT:-}"                          # e.g. https://<accountid>.r2.cloudflarestorage.com
+R2_BUCKET="${R2_BUCKET:-}"                              # e.g. ezmdl
+R2_ACCESS_KEY_ID="${R2_ACCESS_KEY_ID:-}"                # uploader key id
+R2_SECRET_ACCESS_KEY="${R2_SECRET_ACCESS_KEY:-}"        # uploader secret
+export AWS_EC2_METADATA_DISABLED="true"
 ### -------------------------------------------------------------------------
 
 [[ "${EUID}" -eq 0 ]] || { echo "Please run as root"; exit 1; }
@@ -606,7 +727,7 @@ PRIO="11000"
 ip route replace default via "${PUB_GW}" dev "${PUB_DEV}" table "${TABLE_NAME}"
 
 # Ensure rule exists (replace is not supported for rules).
-if ip rule show | grep -qE "^${PRIO}:.*from ${PUB_IP}/32 lookup ${TABLE_NAME}\b"; then
+if ip rule show | grep -qE "^${PRIO}:.*from ${PUB_IP}/32 lookup ${TABLE_NAME}"; then
   :
 else
   # remove any stale rule at this priority
@@ -678,7 +799,6 @@ EOF
 systemctl daemon-reload
 systemctl enable --now ytpdl-mullvad-exclude-ports.service
 
-
 echo "==> 1.5) Install Deno (system-wide, for yt-dlp YouTube extraction)"
 # Non-interactive:
 #   --yes            => skip prompts / accept defaults
@@ -694,7 +814,9 @@ mkdir -p "${APP_DIR}"
 python3 -m venv "${VENV_DIR}"
 source "${VENV_DIR}/bin/activate"
 pip install --upgrade pip
-pip install "ytp-dl==0.9.8" "yt-dlp[default]" gunicorn
+
+# Always install boto3 (small + simplifies toggling R2 via env var).
+pip install "ytp-dl==2026.4.10.2" "yt-dlp[default]" gunicorn boto3
 deactivate
 
 echo "==> 3) API environment file (/etc/default/ytp-dl-api)"
@@ -702,6 +824,16 @@ tee /etc/default/ytp-dl-api >/dev/null <<EOF
 YTPDL_MAX_CONCURRENT=${YTPDL_MAX_CONCURRENT}
 YTPDL_MULLVAD_LOCATION=${YTPDL_MULLVAD_LOCATION}
 YTPDL_VENV=${VENV_DIR}
+
+GUNICORN_WORKERS=${GUNICORN_WORKERS}
+GUNICORN_THREADS=${GUNICORN_THREADS}
+
+YTPDL_R2_UPLOAD=${YTPDL_R2_UPLOAD}
+R2_ENDPOINT=${R2_ENDPOINT}
+R2_BUCKET=${R2_BUCKET}
+R2_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID}
+R2_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY}
+AWS_EC2_METADATA_DISABLED=true
 EOF
 
 echo "==> 4) Gunicorn systemd service (ytp-dl-api.service on :${PORT})"
@@ -719,12 +851,12 @@ EnvironmentFile=/etc/default/ytp-dl-api
 Environment=VIRTUAL_ENV=${VENV_DIR}
 Environment=PATH=${VENV_DIR}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 
-ExecStart=${VENV_DIR}/bin/gunicorn -k gthread -w 1 --threads ${GUNICORN_THREADS}   --timeout 0 --graceful-timeout 15 --keep-alive 20   --bind 0.0.0.0:${PORT} scripts.api:app
+ExecStart=${VENV_DIR}/bin/gunicorn -k gthread -w ${GUNICORN_WORKERS} --threads ${GUNICORN_THREADS}   --timeout 0 --graceful-timeout 15 --keep-alive 20   --bind 0.0.0.0:${PORT} scripts.api:app
 
 Restart=always
 RestartSec=3
 LimitNOFILE=65535
-MemoryMax=800M
+MemoryMax=1G
 
 [Install]
 WantedBy=multi-user.target
