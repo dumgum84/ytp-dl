@@ -7,11 +7,18 @@ import queue
 import shutil
 import threading
 import time
+import mimetypes
+from dataclasses import dataclass
 from threading import BoundedSemaphore, Lock
+from typing import Callable
+
+import boto3
+from botocore.config import Config as BotoConfig
+from botocore.exceptions import BotoCoreError, ClientError
 
 from flask import Flask, Response, jsonify, request, send_file, stream_with_context
 
-from .downloader import download_video, validate_environment
+from .downloader import download_video, validate_environment, is_playlist_url
 
 app = Flask(__name__)
 
@@ -20,40 +27,43 @@ os.makedirs(BASE_DOWNLOAD_DIR, exist_ok=True)
 
 MAX_CONCURRENT = int(os.environ.get("YTPDL_MAX_CONCURRENT", "1"))
 
-# Thread-safe concurrency gate (caps actual download jobs).
 _sem = BoundedSemaphore(MAX_CONCURRENT)
-
-# Track in-flight jobs for /healthz reporting.
 _in_use = 0
 _in_use_lock = Lock()
 
-# Failsafe: delete abandoned job dirs older than this many seconds.
 STALE_JOB_TTL_S = int(os.environ.get("YTPDL_STALE_JOB_TTL_S", "3600"))
+DONE_TTL_S = int(os.environ.get("YTPDL_DONE_TTL_S", "300"))
 
 _ALLOWED_EXTENSIONS = {"mp3", "mp4", "best"}
+_R2_CLIENT = None
+
+
+def _truthy(v: str | None) -> bool:
+    return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _sanitize_job_id(job_id: str) -> str:
-    # Keep job_id filesystem-safe (and prevent traversal).
     job_id = (job_id or "").strip()
     safe = "".join(c for c in job_id if c.isalnum() or c in ("-", "_"))
     return safe or str(int(time.time() * 1000))
 
 
 def _job_dir(job_id: str) -> str:
-    safe = _sanitize_job_id(job_id)
-    return os.path.join(BASE_DOWNLOAD_DIR, f"ytpdl_{safe}")
+    return os.path.join(BASE_DOWNLOAD_DIR, f"ytpdl_{_sanitize_job_id(job_id)}")
 
 
-def _write_result_meta(job_dir: str, path: str) -> None:
+def _write_result_meta(job_dir: str, path: str, *, r2_key: str | None = None) -> None:
     try:
+        now = int(time.time())
         meta_path = os.path.join(job_dir, "result.json")
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(
                 {
                     "path": os.path.abspath(path),
                     "filename": os.path.basename(path),
-                    "ts": int(time.time()),
+                    "r2_key": r2_key,
+                    "ts": now,
+                    "expires_at": now + max(0, int(DONE_TTL_S)),
                 },
                 f,
                 ensure_ascii=False,
@@ -73,6 +83,16 @@ def _read_result_meta(job_dir: str) -> dict | None:
         return None
 
 
+def _schedule_delete_job_dir(job_dir: str, *, after_s: int) -> None:
+    def _worker():
+        try:
+            time.sleep(max(0, int(after_s)))
+            shutil.rmtree(job_dir, ignore_errors=True)
+        except Exception:
+            pass
+    threading.Thread(target=_worker, daemon=True).start()
+
+
 def _cleanup_stale_jobs() -> None:
     now = time.time()
     try:
@@ -80,12 +100,20 @@ def _cleanup_stale_jobs() -> None:
             p = os.path.join(BASE_DOWNLOAD_DIR, name)
             if not os.path.isdir(p):
                 continue
+            meta = _read_result_meta(p)
+            if isinstance(meta, dict):
+                exp = meta.get("expires_at")
+                try:
+                    if exp is not None and now >= float(exp):
+                        shutil.rmtree(p, ignore_errors=True)
+                        continue
+                except Exception:
+                    pass
             try:
-                age = now - os.path.getmtime(p)
+                if now - os.path.getmtime(p) > STALE_JOB_TTL_S:
+                    shutil.rmtree(p, ignore_errors=True)
             except Exception:
-                continue
-            if age > STALE_JOB_TTL_S:
-                shutil.rmtree(p, ignore_errors=True)
+                pass
     except Exception:
         pass
 
@@ -107,13 +135,146 @@ def _release_job_slot() -> None:
     _sem.release()
 
 
+def _r2_enabled() -> bool:
+    return _truthy(os.environ.get("YTPDL_R2_UPLOAD", "0"))
+
+
+def _get_r2_client():
+    global _R2_CLIENT
+    if _R2_CLIENT is not None:
+        return _R2_CLIENT
+    endpoint = (os.environ.get("R2_ENDPOINT") or "").strip().rstrip("/")
+    bucket = (os.environ.get("R2_BUCKET") or "").strip()
+    access_key = (os.environ.get("R2_ACCESS_KEY_ID") or "").strip()
+    secret_key = (os.environ.get("R2_SECRET_ACCESS_KEY") or "").strip()
+    if not endpoint or not bucket or not access_key or not secret_key:
+        return None
+    _R2_CLIENT = boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        region_name=os.environ.get("AWS_REGION", "auto"),
+        config=BotoConfig(signature_version="s3v4", s3={"addressing_style": "path"}),
+    )
+    return _R2_CLIENT
+
+
+def _guess_content_type(filename: str) -> str:
+    ct = mimetypes.guess_type(filename)[0]
+    if ct:
+        return ct
+    low = (filename or "").lower()
+    if low.endswith(".mp3"):
+        return "audio/mpeg"
+    if low.endswith(".mp4"):
+        return "video/mp4"
+    if low.endswith(".zip"):
+        return "application/zip"
+    return "application/octet-stream"
+
+
+@dataclass
+class _ProgressState:
+    total: int
+    sent: int = 0
+    last_emit_t: float = 0.0
+    last_pct_int: int = -1
+    lock: Lock = Lock()
+
+
+def _make_r2_progress_cb(
+    *,
+    total_bytes: int,
+    on_progress: Callable[[float], None],
+    min_interval_s: float = 0.25,
+    min_step_pct: int = 1,
+) -> Callable[[int], None]:
+    st = _ProgressState(total=max(0, int(total_bytes or 0)))
+
+    def cb(bytes_amount: int) -> None:
+        if bytes_amount <= 0:
+            return
+        now = time.monotonic()
+        with st.lock:
+            st.sent = min(st.total, st.sent + int(bytes_amount))
+            if st.total <= 0:
+                return
+            pct = (st.sent * 100.0) / st.total
+            pct_int = int(pct)
+            should_emit = (pct_int >= 100 and st.last_pct_int != 100) or (
+                (now - st.last_emit_t) >= min_interval_s
+                and (pct_int - st.last_pct_int) >= min_step_pct
+            )
+            if not should_emit:
+                return
+            st.last_emit_t = now
+            st.last_pct_int = pct_int
+        on_progress(min(100.0, max(0.0, float(pct))))
+
+    return cb
+
+
+def _upload_to_r2(
+    *,
+    local_path: str,
+    job_id: str,
+    filename: str,
+    on_progress: Callable[[float], None] | None = None,
+) -> str:
+    bucket = (os.environ.get("R2_BUCKET") or "").strip()
+    client = _get_r2_client()
+    if client is None or not bucket:
+        raise RuntimeError("R2 not configured (missing endpoint/bucket/keys)")
+    key = f"{_sanitize_job_id(job_id)}/{filename}"
+    ct = _guess_content_type(filename)
+    extra = {"ContentType": ct, "ContentDisposition": f'inline; filename="{filename}"'}
+    try:
+        total = int(os.path.getsize(local_path))
+    except Exception:
+        total = 0
+    cb = None
+    if on_progress is not None and total > 0:
+        cb = _make_r2_progress_cb(total_bytes=total, on_progress=on_progress)
+    client.upload_file(local_path, bucket, key, ExtraArgs=extra, Callback=cb)
+    return key
+
+
+# ─── Playlist ZIP sibling helper ─────────────────────────────────────────────
+
+def _zip_sibling(result_path: str) -> str | None:
+    """Return the ZIP basename if one exists alongside the concat result file."""
+    if not result_path:
+        return None
+    stem, _ = os.path.splitext(result_path)
+    zip_path = stem + ".zip"
+    if os.path.isfile(zip_path):
+        return os.path.basename(zip_path)
+    return None
+
+
+# ─── Routes ──────────────────────────────────────────────────────────────────
+
 @app.route("/api/download", methods=["POST"])
 def handle_download():
     """
-    Streams real-time yt-dlp stdout lines as SSE `data:` events.
+    Streams real-time yt-dlp stdout as SSE events.
 
-    When finished, the client (or your Render relay) fetches the file via:
-      GET /api/fetch/<job_id>
+    For playlists, creates a concat file (player preview) + ZIP (individual
+    tracks). The ZIP is kept for YTPDL_PLAYLIST_DONE_TTL_S seconds (default
+    600) so Render can fetch it before cleanup.
+
+    SSE event summary
+    -----------------
+    [start]     job_id=<id>
+    <yt-dlp lines>
+    [zip_file]  <zip filename>   (playlist only)
+    [ready]     job_id=<id>
+    [file]      <concat filename>
+    [r2_upload] XX.XX%           (if R2 enabled on VPS)
+    [r2]        key=<key>        (if R2 enabled on VPS)
+    [fetch]     /api/fetch/<id>
+    [done]
     """
     _cleanup_stale_jobs()
 
@@ -141,19 +302,16 @@ def handle_download():
 
         if extension not in _ALLOWED_EXTENSIONS:
             _release_once()
-            return jsonify(
-                error=f"Invalid 'extension'. Allowed: {sorted(_ALLOWED_EXTENSIONS)}"
-            ), 400
+            return jsonify(error=f"Invalid 'extension'. Allowed: {sorted(_ALLOWED_EXTENSIONS)}"), 400
 
         job_dir = _job_dir(job_id)
         os.makedirs(job_dir, exist_ok=True)
 
         q: "queue.Queue[str]" = queue.Queue(maxsize=5000)
         done = threading.Event()
-        result: dict = {"path": None, "error": None}
+        result: dict = {"path": None, "error": None, "r2_key": None, "r2_error": None}
 
         def push(line: str) -> None:
-            # best-effort; drop if client is too slow
             try:
                 q.put_nowait(str(line))
             except Exception:
@@ -169,7 +327,32 @@ def handle_download():
                     on_line=push,
                 )
                 result["path"] = path
-                _write_result_meta(job_dir, path)
+
+                if _r2_enabled():
+                    try:
+                        fname = os.path.basename(path) if path else ""
+                        if fname:
+                            def _on_pct(pct: float) -> None:
+                                push(f"[r2_upload] {pct:.2f}%")
+                            result["r2_key"] = _upload_to_r2(
+                                local_path=path,
+                                job_id=job_id,
+                                filename=fname,
+                                on_progress=_on_pct,
+                            )
+                            push("[r2_upload] 100.00%")
+                    except (BotoCoreError, ClientError, Exception) as e:
+                        result["r2_error"] = str(e)
+
+                _write_result_meta(job_dir, path, r2_key=result.get("r2_key"))
+
+                # Use a longer TTL when a playlist ZIP sibling exists so
+                # Render has time to make a second fetch for the ZIP.
+                zip_name = _zip_sibling(path)
+                result["zip_name"] = zip_name
+                ttl = int(os.environ.get("YTPDL_PLAYLIST_DONE_TTL_S", "600")) if zip_name else DONE_TTL_S
+                _schedule_delete_job_dir(job_dir, after_s=ttl)
+
             except Exception as e:
                 result["error"] = str(e)
             finally:
@@ -179,16 +362,16 @@ def handle_download():
         threading.Thread(target=worker, daemon=True).start()
 
         def gen():
-            # Initial line so clients see the stream immediately.
             yield f"data: [start] job_id={job_id}\n\n"
             last_keepalive = time.monotonic()
 
             while not done.is_set() or not q.empty():
                 try:
                     line = q.get(timeout=0.5)
+                    if line.startswith("[playlist_title] "):
+                        continue
                     yield f"data: {line}\n\n"
                 except queue.Empty:
-                    # occasional comment keepalive for picky proxies (NOT a data event)
                     if (time.monotonic() - last_keepalive) >= 15:
                         yield ": keep-alive\n\n"
                         last_keepalive = time.monotonic()
@@ -201,19 +384,28 @@ def handle_download():
 
             p = result.get("path") or ""
             fname = os.path.basename(p) if p else ""
+
+            # Emit ZIP name so Render can fetch it as a separate file.
+            zip_name = result.get("zip_name")
+            if zip_name:
+                yield f"data: [zip_file] {zip_name}\n\n"
+
             yield f"data: [ready] job_id={job_id}\n\n"
-            yield f"data: [file] {fname}\n\n"
+            if fname:
+                yield f"data: [file] {fname}\n\n"
+
+            if result.get("r2_key"):
+                yield f"data: [r2] key={result['r2_key']}\n\n"
+            elif result.get("r2_error"):
+                yield f"data: [r2_error] {result['r2_error']}\n\n"
+
             yield f"data: [fetch] /api/fetch/{job_id}\n\n"
             yield "data: [done]\n\n"
 
-        headers = {
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        }
+        headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
         return Response(
-            stream_with_context(gen()),
-            headers=headers,
-            content_type="text/event-stream",
+            stream_with_context(gen()), headers=headers,
+            content_type="text/event-stream; charset=utf-8",
         )
 
     except Exception as e:
@@ -223,6 +415,7 @@ def handle_download():
 
 @app.route("/api/fetch/<job_id>", methods=["GET"])
 def fetch_job(job_id: str):
+    """Serve the primary output file (concat media file for playlists, single file otherwise)."""
     job_id = _sanitize_job_id(job_id)
     job_dir = _job_dir(job_id)
     meta = _read_result_meta(job_dir)
@@ -233,16 +426,52 @@ def fetch_job(job_id: str):
     if not path or not os.path.exists(path):
         return jsonify(error="File missing"), 404
 
-    response = send_file(path, as_attachment=True)
+    filename = os.path.basename(path)
+    response = send_file(
+        path,
+        mimetype=_guess_content_type(filename),
+        as_attachment=True,
+        download_name=filename,
+    )
 
-    def _cleanup() -> None:
-        try:
-            shutil.rmtree(job_dir, ignore_errors=True)
-        except Exception:
-            pass
+    # Only delete immediately when there is no ZIP sibling that Render still
+    # needs to fetch.  Playlist jobs use TTL-based deletion instead.
+    if _zip_sibling(path) is None:
+        def _cleanup() -> None:
+            try:
+                shutil.rmtree(job_dir, ignore_errors=True)
+            except Exception:
+                pass
+        response.call_on_close(_cleanup)
 
-    response.call_on_close(_cleanup)
     return response
+
+
+@app.route("/api/fetch/<job_id>/<path:filename>", methods=["GET"])
+def fetch_job_file(job_id: str, filename: str):
+    """
+    Serve an individual track from a playlist job for inline streaming.
+    The frontend uses this to play tracks sequentially in the media player
+    while the ZIP is available for bulk download via /api/fetch/<job_id>.
+    """
+    job_id = _sanitize_job_id(job_id)
+    job_dir = _job_dir(job_id)
+
+    # Prevent path traversal: only allow bare filenames inside job_dir.
+    safe_name = os.path.basename(filename)
+    if not safe_name:
+        return jsonify(error="Invalid filename"), 400
+
+    file_path = os.path.join(job_dir, safe_name)
+    if not os.path.isfile(file_path):
+        return jsonify(error="File not found"), 404
+
+    return send_file(
+        file_path,
+        mimetype=_guess_content_type(safe_name),
+        as_attachment=False,
+        conditional=True,   # honours Range / If-Modified-Since for seeking
+    )
 
 
 @app.route("/healthz", methods=["GET"])
@@ -254,7 +483,7 @@ def healthz():
 
 def main():
     validate_environment()
-    print("Starting ytp-dl API server...")
+    print("Starting ytp-dl API server…")
     app.run(host="0.0.0.0", port=5000)
 
 
