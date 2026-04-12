@@ -243,8 +243,12 @@ def _upload_to_r2(
 # ─── Playlist ZIP sibling helper ─────────────────────────────────────────────
 
 def _zip_sibling(result_path: str) -> str | None:
-    """Return the ZIP basename if one exists alongside the concat result file."""
+    """Return the ZIP basename if one exists alongside the result file.
+    Returns None when the result IS a zip (no separate sibling exists)."""
     if not result_path:
+        return None
+    # If the primary result is itself a ZIP, there is no sibling.
+    if result_path.lower().endswith(".zip"):
         return None
     stem, _ = os.path.splitext(result_path)
     zip_path = stem + ".zip"
