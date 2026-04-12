@@ -48,6 +48,11 @@ _BOT_RX = re.compile(
 )
 
 
+# SoundCloud is audio-only — used by download_multi_url for per-URL
+# format forcing without relying on the Render-side SC override.
+_SC_URL_RE = re.compile(r"soundcloud\.com", re.IGNORECASE)
+
+
 # =========================
 # Shell helpers
 # =========================
@@ -183,15 +188,67 @@ def _common_flags(*, playlist: bool = False) -> List[str]:
 # Format selectors
 # =========================
 def _fmt_mp4_apple_safe(cap: int) -> str:
+    # Fallback chain so sites like TikTok that lack strict h264+m4a streams
+    # still work under mp4 mode:
+    #   1. Strict h264+m4a  (Apple-safe, YouTube default)
+    #   2. Any mp4 video + any m4a audio
+    #   3. Any single-file mp4 stream
+    #   4. Anything available — remuxed to mp4 by --merge-output-format
     return (
         f"bv*[height<={cap}][ext=mp4][vcodec~='^(avc1|h264)']"
         f"+ba[ext=m4a][acodec~='^mp4a']"
-        f"/b[height<={cap}][ext=mp4][vcodec~='^(avc1|h264)'][acodec~='^mp4a']"
+        f"/bv*[height<={cap}][ext=mp4]+ba[ext=m4a]"
+        f"/b[height<={cap}][ext=mp4]"
+        f"/b[height<={cap}]"
     )
 
 
 def _fmt_best(cap: int) -> str:
     return f"bv*[height<={cap}]+ba/b[height<={cap}]"
+
+
+# =========================
+# Playlist item count helper
+# =========================
+def _get_url_item_count(url: str) -> int:
+    """
+    Quickly determine how many downloadable items a URL represents.
+    Returns 1 for single videos, N for playlists/sets.
+    Uses --flat-playlist with --playlist-items 1 to read playlist_count
+    from the first entry's metadata — no media is downloaded.
+    Falls back to 1 on any error so downloading always proceeds.
+    """
+    if not is_playlist_url(url):
+        return 1
+    try:
+        result = subprocess.run(
+            [
+                YTDLP_BIN,
+                "--flat-playlist",
+                "--quiet",
+                "--print", "%(playlist_count)s",
+                "--playlist-items", "1",
+                "--yes-playlist",
+                "--no-cache-dir",
+                "--ignore-config",
+                "--retries", "2",
+                "--user-agent", MODERN_UA,
+                url,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+        )
+        for line in (result.stdout or "").strip().splitlines():
+            line = line.strip()
+            if line and line != "NA" and line.isdigit():
+                n = int(line)
+                if n > 0:
+                    return n
+    except Exception:
+        pass
+    return 1  # safe fallback
 
 
 # =========================
@@ -549,6 +606,78 @@ def _concatenate_files(files: List[str], output_path: str) -> str:
 
 
 # =========================
+# Codec compatibility helpers
+# =========================
+def _probe_video_codec(path: str) -> "Optional[str]":
+    """Return the first video stream codec name, or None if audio-only."""
+    try:
+        r = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=codec_name",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                path,
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=10,
+        )
+        lines = (r.stdout or "").strip().splitlines()
+        return lines[0].strip() if lines else None
+    except Exception:
+        return None
+
+
+def _concat_compatible(files: List[str]) -> bool:
+    """
+    Return True when all files can be losslessly concatenated with the
+    ffmpeg concat demuxer — i.e. they all share the same container
+    extension AND the same video codec (or are all audio-only with the
+    same extension). Mixed extensions or codecs require re-encoding.
+    """
+    if not files:
+        return False
+    exts = {os.path.splitext(p)[1].lower() for p in files}
+    if len(exts) > 1:
+        return False  # mixed containers (e.g. .mp4 + .mp3)
+    codecs = {_probe_video_codec(p) for p in files}
+    return len(codecs) == 1  # all same codec, including all-None (audio-only)
+
+
+def _concatenate_audio_only(files: List[str], output_path: str) -> str:
+    """
+    Extract audio from every file and concatenate into a single MP3 using
+    ffmpeg's concat filter. Unlike the concat demuxer, the filter re-encodes
+    all inputs into one uniform audio stream, guaranteeing seamless playback
+    regardless of differing sample rates, bitrates, or codecs across sources
+    (e.g. TikTok AAC vs YouTube AAC at different sample rates).
+    The original files are never modified — this only builds the preview.
+    """
+    if not files:
+        raise RuntimeError("No files to concatenate.")
+
+    # Build: -i f1 -i f2 ... -filter_complex [0:a][1:a]concat=n=N:v=0:a=1[aout]
+    cmd = [FFMPEG_BIN, "-y"]
+    for f in files:
+        cmd += ["-i", f]
+    n = len(files)
+    filter_inputs = "".join(f"[{i}:a]" for i in range(n))
+    filter_complex = f"{filter_inputs}concat=n={n}:v=0:a=1[aout]"
+    cmd += [
+        "-filter_complex", filter_complex,
+        "-map", "[aout]",
+        "-acodec", "libmp3lame",
+        "-q:a", "0",          # VBR best quality
+        output_path,
+    ]
+
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"Audio concat failed:\n{(result.stdout or '')[-2000:]}")
+    return output_path
+
+
+# =========================
 # Playlist downloader
 # =========================
 def download_playlist(
@@ -580,6 +709,12 @@ def download_playlist(
     if not mullvad_wait_connected():
         raise RuntimeError("Mullvad connection failed")
 
+    # Emit total item count before downloading so the frontend can scale
+    # the progress bar correctly from the very first track.
+    _orig_on_line_pre = on_line
+    _item_count = _get_url_item_count(url)
+    on_line(f"[total_items] {_item_count}")
+
     mode = (extension or "mp3").lower().strip()
     cap = int(resolution or 1080)
 
@@ -590,11 +725,17 @@ def download_playlist(
     abort_event = threading.Event()
 
     _playlist_title: list = []
+    _expected_count: list = []
     _orig_on_line = on_line
 
     def _capturing_on_line(line: str) -> None:
         if line.startswith("[playlist_title] ") and not _playlist_title:
             _playlist_title.append(line[len("[playlist_title] "):].strip())
+        if line.startswith("[playlist_count] ") and not _expected_count:
+            try:
+                _expected_count.append(int(line.split(None, 1)[1].strip()))
+            except Exception:
+                pass
         if _BOT_RX.search(line) and not abort_event.is_set():
             abort_event.set()
             _orig_on_line("[info] Rate limited — aborting and retrying with fresh VPN IP")
@@ -605,7 +746,7 @@ def download_playlist(
     try:
         if mode == "mp3":
             files = _download_with_format_stream(
-                url=url, out_dir=out_dir, fmt="bestaudio",
+                url=url, out_dir=out_dir, fmt="bestaudio/best",
                 merge_output_format=None, extract_mp3=True,
                 on_line=on_line, playlist=True,
                 abort_event=abort_event, archive_path=archive_path,
@@ -644,26 +785,231 @@ def download_playlist(
         if not files:
             raise RuntimeError("No tracks could be downloaded from this playlist.")
 
+        # ---- Playlist fill-in passes ---------------------------------------
+        # --ignore-errors causes yt-dlp to silently skip a track once its
+        # internal retries are exhausted, so the job exits cleanly with fewer
+        # files than expected.  We fix this by re-running yt-dlp on the same
+        # playlist URL up to (YTPDL_PLAYLIST_PASSES - 1) extra times.  The
+        # --download-archive file records every completed track ID, so each
+        # re-run skips already-downloaded tracks instantly and only attempts
+        # the ones that failed.  We stop early when either:
+        #   (a) file count matches the expected playlist count, or
+        #   (b) a pass produced no new files — remaining tracks are
+        #       permanently unavailable (private, deleted, geo-blocked).
+        # Kept local to the VPS — Render's retry system handles connection-
+        # level failures (rate limits, VPS errors); this handles per-track
+        # transient failures within an otherwise healthy job.
+        _passes = int(os.environ.get("YTPDL_PLAYLIST_PASSES", "5"))
+        _expected = _expected_count[0] if _expected_count else None
+
+        for _pass in range(1, _passes):
+            if _expected is not None and len(files) >= _expected:
+                break
+            prev_count = len(files)
+            missing = (_expected - prev_count) if _expected else "some"
+            _orig_on_line(f"[info] {missing} track(s) missing — playlist pass {_pass + 1}/{_passes}")
+            fill_abort = threading.Event()
+            try:
+                if mode == "mp3":
+                    files = _download_with_format_stream(
+                        url=url, out_dir=out_dir, fmt="bestaudio/best",
+                        merge_output_format=None, extract_mp3=True,
+                        on_line=on_line, playlist=True,
+                        abort_event=fill_abort, archive_path=archive_path,
+                    )
+                elif mode == "best":
+                    try:
+                        files = _download_with_format_stream(
+                            url=url, out_dir=out_dir, fmt=_fmt_best(cap),
+                            merge_output_format=None, extract_mp3=False,
+                            on_line=on_line, playlist=True,
+                            abort_event=fill_abort, archive_path=archive_path,
+                        )
+                    except Exception:
+                        files = _download_with_format_stream(
+                            url=url, out_dir=out_dir, fmt=_fmt_mp4_apple_safe(cap),
+                            merge_output_format="mp4", extract_mp3=False,
+                            on_line=on_line, playlist=True,
+                            abort_event=fill_abort, archive_path=archive_path,
+                        )
+                else:
+                    files = _download_with_format_stream(
+                        url=url, out_dir=out_dir, fmt=_fmt_mp4_apple_safe(cap),
+                        merge_output_format="mp4", extract_mp3=False,
+                        on_line=on_line, playlist=True,
+                        abort_event=fill_abort, archive_path=archive_path,
+                    )
+            except RuntimeError:
+                raise  # propagate rate-limit kills to Render's retry system
+            except Exception as e:
+                _orig_on_line(f"[info] Playlist pass {_pass + 1} error: {e} — keeping {len(files)} tracks")
+                break
+            if fill_abort.is_set():
+                raise RuntimeError(
+                    "Rate limited during playlist pass — retrying with fresh VPN IP. "
+                    "Already-downloaded tracks will be skipped on retry."
+                )
+            if len(files) <= prev_count:
+                _orig_on_line("[info] No new tracks recovered — remaining tracks are likely unavailable")
+                break
+            _orig_on_line(f"[info] Playlist pass {_pass + 1}: recovered {len(files) - prev_count} track(s)")
+        # ---- End playlist passes -------------------------------------------
+
         title = _playlist_title[0] if _playlist_title else None
         stem = _sanitize_filename_stem(title)
-        ext = "mp3" if mode == "mp3" else "mp4"
 
-        # 1. ZIP of individual tracks — for download.
+        # ZIP of individual tracks — returned as primary result.
+        # Render extracts it, uploads individual files for sequential playback,
+        # and re-uploads the ZIP for the download button. No concat needed.
         zip_path = os.path.join(out_dir, f"{stem}.zip")
         _create_zip(files, zip_path)
 
-        # 2. Concatenated single file.
-        concat_path = os.path.join(out_dir, f"{stem}.{ext}")
-        _concatenate_files(files, concat_path)
-
-        # Tell Render the ZIP filename so it can fetch and upload it.
-        _orig_on_line(f"[zip_file] {os.path.basename(zip_path)}")
-
-        return concat_path
+        return zip_path
 
     finally:
         if _mullvad_present():
             _run_argv(["mullvad", "disconnect"], check=False)
+
+# =========================
+# Multi-URL downloader
+# =========================
+def download_multi_url(
+    *,
+    urls: List[str],
+    resolution: "int | None" = 1080,
+    extension: Optional[str] = None,
+    out_dir: str = DEFAULT_OUT_DIR,
+    on_line: Callable[[str], None],
+) -> str:
+    """
+    Download a comma-separated list of URLs into a single ZIP (multi_url.zip).
+
+    Each URL downloads into its own subdirectory to prevent filename
+    collisions. Playlist URLs are expanded with the same fill-in passes as
+    download_playlist. All collected files are ZIPped as multi_url.zip.
+
+    Codec compatibility is checked after all downloads complete:
+      - All files share the same container AND video codec (or are all
+        audio-only) -> lossless concat as multi_url.<ext>, ZIP is sibling.
+      - Mixed codecs / containers -> audio is extracted and re-encoded to
+        MP3 (fast, seconds per track), concatenated as multi_url.mp3.
+        [concat_mode] audio_only is emitted so the frontend knows to use
+        the audio player. ZIP still contains all original files.
+
+    In both cases the frontend receives a playable file and a downloadable
+    ZIP — the difference is just video player vs audio player.
+    """
+    out_dir = os.path.abspath(out_dir)
+    os.makedirs(out_dir, exist_ok=True)
+
+    validate_environment()
+    require_mullvad_login()
+    mullvad_connect(MULLVAD_LOCATION)
+    if not mullvad_wait_connected():
+        raise RuntimeError("Mullvad connection failed")
+
+    # Emit total item count across all URLs before any downloading starts
+    # so the frontend progress bar is scaled correctly from the beginning.
+    _total_items = sum(_get_url_item_count(u) for u in urls)
+    on_line(f"[total_items] {_total_items}")
+
+    mode = (extension or "mp4").lower().strip()
+    cap = int(resolution or 1080)
+    _passes = int(os.environ.get("YTPDL_PLAYLIST_PASSES", "5"))
+
+    # Shared rate-limit abort — any URL hitting 429/bot-detection aborts all.
+    shared_abort = threading.Event()
+    all_files: List[str] = []
+
+    def _on_line_intercepted(line: str) -> None:
+        if _BOT_RX.search(line) and not shared_abort.is_set():
+            shared_abort.set()
+            on_line("[info] Rate limited — aborting and retrying with fresh VPN IP")
+        on_line(line)
+
+    def _run(url: str, url_dir: str, is_pl: bool,
+             fmt: str, merge_fmt: Optional[str], mp3: bool,
+             ab: threading.Event) -> List[str]:
+        archive = os.path.join(url_dir, ".ytdlp-archive") if is_pl else None
+        result = _download_with_format_stream(
+            url=url, out_dir=url_dir, fmt=fmt,
+            merge_output_format=merge_fmt, extract_mp3=mp3,
+            on_line=_on_line_intercepted, playlist=is_pl,
+            abort_event=ab, archive_path=archive,
+        )
+        return [result] if isinstance(result, str) else result
+
+    try:
+        for i, url in enumerate(urls):
+            if shared_abort.is_set():
+                raise RuntimeError(
+                    "Rate limited — retrying with fresh VPN IP. Re-submit to continue."
+                )
+
+            url_dir = os.path.join(out_dir, f"url_{i:03d}")
+            os.makedirs(url_dir, exist_ok=True)
+            on_line(f"[info] URL {i + 1}/{len(urls)}: {url}")
+
+            is_pl = is_playlist_url(url)
+            # Force mp3 for SoundCloud per-URL regardless of user format choice.
+            effective_mode = "mp3" if _SC_URL_RE.search(url) else mode
+
+            ua = threading.Event()
+            if effective_mode == "mp3":
+                files = _run(url, url_dir, is_pl, "bestaudio/best", None, True, ua)
+            elif effective_mode == "best":
+                try:
+                    files = _run(url, url_dir, is_pl, _fmt_best(cap), None, False, ua)
+                except Exception:
+                    files = _run(url, url_dir, is_pl, _fmt_mp4_apple_safe(cap), "mp4", False, ua)
+            else:
+                files = _run(url, url_dir, is_pl, _fmt_mp4_apple_safe(cap), "mp4", False, ua)
+
+            if ua.is_set():
+                raise RuntimeError("Rate limited — retrying with fresh VPN IP.")
+
+            # Playlist fill-in passes (mirrors download_playlist logic).
+            if is_pl and files:
+                for _pass in range(1, _passes):
+                    prev = len(files)
+                    pa = threading.Event()
+                    try:
+                        if effective_mode == "mp3":
+                            files = _run(url, url_dir, True, "bestaudio/best", None, True, pa)
+                        elif effective_mode == "best":
+                            try:
+                                files = _run(url, url_dir, True, _fmt_best(cap), None, False, pa)
+                            except Exception:
+                                files = _run(url, url_dir, True, _fmt_mp4_apple_safe(cap), "mp4", False, pa)
+                        else:
+                            files = _run(url, url_dir, True, _fmt_mp4_apple_safe(cap), "mp4", False, pa)
+                    except RuntimeError:
+                        raise
+                    except Exception:
+                        break
+                    if pa.is_set():
+                        raise RuntimeError("Rate limited during playlist pass — retrying.")
+                    if len(files) <= prev:
+                        break
+
+            all_files.extend(files)
+
+        if not all_files:
+            raise RuntimeError("No files could be downloaded from the provided URLs.")
+
+        # ZIP all files — returned as primary result.
+        # Render extracts it, uploads individual files for sequential playback,
+        # and re-uploads the ZIP for the download button. No concat needed,
+        # so codec differences between URLs are not an issue.
+        zip_path = os.path.join(out_dir, "multi_url.zip")
+        _create_zip(all_files, zip_path)
+
+        return zip_path
+
+    finally:
+        if _mullvad_present():
+            _run_argv(["mullvad", "disconnect"], check=False)
+
 
 # =========================
 # Public entry point
@@ -682,6 +1028,16 @@ def download_video(
     """
     if not url:
         raise RuntimeError("Missing URL")
+
+    # Multi-URL: two or more comma-separated URLs -> download_multi_url.
+    if "," in url:
+        urls = [u.strip() for u in url.split(",") if u.strip()]
+        if len(urls) > 1:
+            return download_multi_url(
+                urls=urls, resolution=resolution, extension=extension,
+                out_dir=out_dir, on_line=on_line,
+            )
+        url = urls[0]  # single URL with stray trailing comma
 
     if is_playlist_url(url):
         return download_playlist(
@@ -703,7 +1059,7 @@ def download_video(
 
         if mode == "mp3":
             return _download_with_format_stream(
-                url=url, out_dir=out_dir, fmt="bestaudio",
+                url=url, out_dir=out_dir, fmt="bestaudio/best",
                 merge_output_format=None, extract_mp3=True, on_line=on_line,
             )
         if mode == "best":
