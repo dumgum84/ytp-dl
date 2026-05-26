@@ -26,7 +26,7 @@ MODERN_UA = os.environ.get(
     "YTPDL_USER_AGENT",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36",
+    "Chrome/148.0.0.0 Safari/537.36",
 )
 
 FFMPEG_BIN = shutil.which("ffmpeg") or "ffmpeg"
@@ -51,6 +51,37 @@ _BOT_RX = re.compile(
 # SoundCloud is audio-only — used by download_multi_url for per-URL
 # format forcing without relying on the Render-side SC override.
 _SC_URL_RE = re.compile(r"soundcloud\.com", re.IGNORECASE)
+
+# =========================
+# Mullvad state (module-level, shared across all threads)
+# =========================
+_mullvad_lock = threading.Lock()
+_mullvad_connected = False
+
+
+def _ensure_mullvad() -> None:
+    """Connect to Mullvad only if not already connected. Thread-safe."""
+    global _mullvad_connected
+    if _mullvad_connected:
+        return
+    with _mullvad_lock:
+        if _mullvad_connected:
+            return
+        require_mullvad_login()
+        mullvad_connect(MULLVAD_LOCATION)
+        if not mullvad_wait_connected():
+            raise RuntimeError("Mullvad connection failed")
+        _mullvad_connected = True
+
+
+def _rotate_mullvad() -> None:
+    """Rotate Mullvad IP (disconnect → connect). Called only on bot detection. Thread-safe."""
+    global _mullvad_connected
+    with _mullvad_lock:
+        mullvad_connect(MULLVAD_LOCATION)
+        if not mullvad_wait_connected():
+            raise RuntimeError("Mullvad reconnection failed")
+        _mullvad_connected = True
 
 
 # =========================
@@ -477,6 +508,16 @@ def _download_with_format_stream(
                         pass
                 break
 
+            # Bot detection — rotate IP immediately so Render's retry gets a fresh IP.
+            if _BOT_RX.search(s):
+                if abort_event is not None:
+                    if not abort_event.is_set():
+                        abort_event.set()
+                        _rotate_mullvad()
+                else:
+                    # Single video path — rotate and let yt-dlp fail naturally.
+                    _rotate_mullvad()
+
             if os.path.isabs(s) and s.startswith(out_dir):
                 _maybe_add_candidate(s)
                 continue
@@ -704,10 +745,7 @@ def download_playlist(
     os.makedirs(out_dir, exist_ok=True)
 
     validate_environment()
-    require_mullvad_login()
-    mullvad_connect(MULLVAD_LOCATION)
-    if not mullvad_wait_connected():
-        raise RuntimeError("Mullvad connection failed")
+    _ensure_mullvad()
 
     # Emit total item count before downloading so the frontend can scale
     # the progress bar correctly from the very first track.
@@ -738,7 +776,8 @@ def download_playlist(
                 pass
         if _BOT_RX.search(line) and not abort_event.is_set():
             abort_event.set()
-            _orig_on_line("[info] Rate limited — aborting and retrying with fresh VPN IP")
+            _rotate_mullvad()
+            _orig_on_line("[info] Rate limited — rotating VPN IP and retrying")
         _orig_on_line(line)
 
     on_line = _capturing_on_line
@@ -867,8 +906,7 @@ def download_playlist(
         return zip_path
 
     finally:
-        if _mullvad_present():
-            _run_argv(["mullvad", "disconnect"], check=False)
+        pass  # VPN stays connected — never disconnect mid-service
 
 # =========================
 # Multi-URL downloader
@@ -903,10 +941,7 @@ def download_multi_url(
     os.makedirs(out_dir, exist_ok=True)
 
     validate_environment()
-    require_mullvad_login()
-    mullvad_connect(MULLVAD_LOCATION)
-    if not mullvad_wait_connected():
-        raise RuntimeError("Mullvad connection failed")
+    _ensure_mullvad()
 
     # Emit total item count across all URLs before any downloading starts
     # so the frontend progress bar is scaled correctly from the beginning.
@@ -924,7 +959,8 @@ def download_multi_url(
     def _on_line_intercepted(line: str) -> None:
         if _BOT_RX.search(line) and not shared_abort.is_set():
             shared_abort.set()
-            on_line("[info] Rate limited — aborting and retrying with fresh VPN IP")
+            _rotate_mullvad()
+            on_line("[info] Rate limited — rotating VPN IP and retrying")
         on_line(line)
 
     def _run(url: str, url_dir: str, is_pl: bool,
@@ -1007,12 +1043,7 @@ def download_multi_url(
         return zip_path
 
     finally:
-        if _mullvad_present():
-            _run_argv(["mullvad", "disconnect"], check=False)
-
-
-# =========================
-# Public entry point
+        pass  # VPN stays connected — never disconnect mid-service
 # =========================
 def download_video(
     *,
@@ -1048,10 +1079,7 @@ def download_video(
     out_dir = os.path.abspath(out_dir)
     os.makedirs(out_dir, exist_ok=True)
     validate_environment()
-    require_mullvad_login()
-    mullvad_connect(MULLVAD_LOCATION)
-    if not mullvad_wait_connected():
-        raise RuntimeError("Mullvad connection failed")
+    _ensure_mullvad()
 
     try:
         mode = (extension or "mp4").lower().strip()
@@ -1078,5 +1106,4 @@ def download_video(
             merge_output_format="mp4", extract_mp3=False, on_line=on_line,
         )
     finally:
-        if _mullvad_present():
-            _run_argv(["mullvad", "disconnect"], check=False)
+        pass  # VPN stays connected — never disconnect mid-service
