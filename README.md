@@ -29,7 +29,7 @@ Privacy-focused media downloader API for Linux VPS deployments — powered by yt
 ## Installation
 
 ```bash
-pip install ytp-dl==2026.4.12.1 yt-dlp[default]
+pip install ytp-dl==2026.5.25 yt-dlp[default]
 ```
 
 ### Requirements
@@ -525,6 +525,8 @@ These are read from `/etc/default/ytp-dl-api`. You can also export any of them b
 | `YTPDL_DONE_TTL_S` | Seconds to keep a completed single-file job dir before deletion | `300` |
 | `YTPDL_PLAYLIST_DONE_TTL_S` | Seconds to keep a completed playlist job dir before deletion (longer to allow fetching both output files) | `600` |
 | `YTPDL_STALE_JOB_TTL_S` | Seconds before an unfinished/unfetched job dir is force-deleted | `3600` |
+| `YTPDL_MIN_FREE_DISK_MB` | Minimum free disk MB — new jobs refused and emergency cleanup triggered below this threshold | `500` |
+| `YTPDL_CLEANUP_INTERVAL_S` | How often the background cleanup thread runs in seconds | `60` |
 | `YTPDL_JOB_TIMEOUT_S` | Hard kill timeout for a single-file yt-dlp process | `1800` |
 | `YTPDL_PLAYLIST_JOB_TIMEOUT_S` | Hard kill timeout for a playlist yt-dlp process | `21600` |
 | `GUNICORN_WORKERS` | Gunicorn worker processes | `1` |
@@ -535,6 +537,7 @@ These are read from `/etc/default/ytp-dl-api`. You can also export any of them b
 | `R2_ACCESS_KEY_ID` | R2 uploader access key id | *(empty)* |
 | `R2_SECRET_ACCESS_KEY` | R2 uploader secret access key | *(empty)* |
 | `AWS_EC2_METADATA_DISABLED` | Disable EC2 metadata fetch | `true` |
+| `YTPDL_VPS_API_TOKEN` | Shared secret to authenticate requests to this API. Must be set to the same value in client-side env. Leave empty to disable auth. | *(empty)* |
 
 To change runtime configuration:
 
@@ -642,7 +645,8 @@ It also installs all runtime dependencies and configures the API as a managed sy
 #   - (Optional) bakes in Cloudflare R2 uploader env vars
 #   - Creates a systemd service ytp-dl-api.service on port 5000
 #
-# Mullvad connect/disconnect is handled per-job by downloader.py.
+# Mullvad IP rotation is handled automatically by downloader.py.
+# VPN connects on first job and stays up. IP rotates only on bot detection.
 
 set -euo pipefail
 
@@ -663,6 +667,7 @@ R2_ENDPOINT="${R2_ENDPOINT:-}"                          # e.g. https://<accounti
 R2_BUCKET="${R2_BUCKET:-}"                              # e.g. ezmdl
 R2_ACCESS_KEY_ID="${R2_ACCESS_KEY_ID:-}"                # uploader key id
 R2_SECRET_ACCESS_KEY="${R2_SECRET_ACCESS_KEY:-}"        # uploader secret
+YTPDL_VPS_API_TOKEN="${YTPDL_VPS_API_TOKEN:-}"          # shared secret — must be set to same value in client-side env; leave empty to disable
 export AWS_EC2_METADATA_DISABLED="true"
 ### -------------------------------------------------------------------------
 
@@ -825,7 +830,7 @@ python3 -m venv "${VENV_DIR}"
 source "${VENV_DIR}/bin/activate"
 pip install --upgrade pip
 
-pip install "ytp-dl==2026.4.12.1" "yt-dlp[default]" gunicorn
+pip install "ytp-dl==2026.5.25" "yt-dlp[default]" gunicorn
 if [[ "${YTPDL_R2_UPLOAD}" == "1" ]]; then
   pip install boto3
 fi
@@ -846,6 +851,7 @@ R2_BUCKET=${R2_BUCKET}
 R2_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID}
 R2_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY}
 AWS_EC2_METADATA_DISABLED=true
+YTPDL_VPS_API_TOKEN=${YTPDL_VPS_API_TOKEN}
 EOF
 
 echo "==> 4) Gunicorn systemd service (ytp-dl-api.service on :${PORT})"
@@ -892,6 +898,5 @@ echo "========================================="
 echo "Installation complete!"
 echo "API running on port ${PORT}"
 echo "Test from outside: curl http://YOUR_VPS_IP:${PORT}/healthz"
-echo "If you use UFW: sudo ufw allow ${PORT}/tcp"
 echo "========================================="
 ```
