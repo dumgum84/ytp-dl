@@ -33,9 +33,26 @@ _in_use_lock = Lock()
 
 STALE_JOB_TTL_S = int(os.environ.get("YTPDL_STALE_JOB_TTL_S", "3600"))
 DONE_TTL_S = int(os.environ.get("YTPDL_DONE_TTL_S", "300"))
+MIN_FREE_DISK_MB = int(os.environ.get("YTPDL_MIN_FREE_DISK_MB", "500"))
+CLEANUP_INTERVAL_S = int(os.environ.get("YTPDL_CLEANUP_INTERVAL_S", "60"))
 
 _ALLOWED_EXTENSIONS = {"mp3", "mp4", "best"}
+_BLOCKED_UAS = ("headlesschrome", "headless", "python-requests", "curl", "wget")
 _R2_CLIENT = None
+_R2_CLIENT_LOCK = threading.Lock()
+
+VPS_API_TOKEN = os.environ.get("YTPDL_VPS_API_TOKEN", "").strip()
+
+
+def _is_blocked_ua() -> bool:
+    ua = request.headers.get("User-Agent", "")
+    return any(bad in ua.lower() for bad in _BLOCKED_UAS)
+
+
+def _is_authorized() -> bool:
+    if not VPS_API_TOKEN:
+        return True
+    return request.headers.get("X-YTPDL-Token", "") == VPS_API_TOKEN
 
 
 def _truthy(v: str | None) -> bool:
@@ -118,6 +135,51 @@ def _cleanup_stale_jobs() -> None:
         pass
 
 
+def _free_disk_mb() -> float:
+    """Return free disk space in MB for BASE_DOWNLOAD_DIR's filesystem."""
+    try:
+        st = os.statvfs(BASE_DOWNLOAD_DIR)
+        return (st.f_bavail * st.f_frsize) / (1024 * 1024)
+    except Exception:
+        return float("inf")
+
+
+def _emergency_cleanup() -> None:
+    """Aggressively delete all job dirs oldest-first until MIN_FREE_DISK_MB is free."""
+    try:
+        dirs = []
+        for name in os.listdir(BASE_DOWNLOAD_DIR):
+            p = os.path.join(BASE_DOWNLOAD_DIR, name)
+            if os.path.isdir(p):
+                try:
+                    dirs.append((os.path.getmtime(p), p))
+                except Exception:
+                    pass
+        dirs.sort()  # oldest first
+        for _, p in dirs:
+            if _free_disk_mb() >= MIN_FREE_DISK_MB:
+                break
+            shutil.rmtree(p, ignore_errors=True)
+    except Exception:
+        pass
+
+
+def _background_cleanup_worker() -> None:
+    """Background thread: runs cleanup every CLEANUP_INTERVAL_S seconds."""
+    while True:
+        try:
+            time.sleep(CLEANUP_INTERVAL_S)
+            _cleanup_stale_jobs()
+            if _free_disk_mb() < MIN_FREE_DISK_MB:
+                _emergency_cleanup()
+        except Exception:
+            pass
+
+
+# Start background cleanup thread on module load.
+threading.Thread(target=_background_cleanup_worker, daemon=True).start()
+
+
 def _try_acquire_job_slot() -> bool:
     global _in_use
     if not _sem.acquire(blocking=False):
@@ -149,14 +211,17 @@ def _get_r2_client():
     secret_key = (os.environ.get("R2_SECRET_ACCESS_KEY") or "").strip()
     if not endpoint or not bucket or not access_key or not secret_key:
         return None
-    _R2_CLIENT = boto3.client(
-        "s3",
-        endpoint_url=endpoint,
-        aws_access_key_id=access_key,
-        aws_secret_access_key=secret_key,
-        region_name=os.environ.get("AWS_REGION", "auto"),
-        config=BotoConfig(signature_version="s3v4", s3={"addressing_style": "path"}),
-    )
+    with _R2_CLIENT_LOCK:
+        if _R2_CLIENT is not None:
+            return _R2_CLIENT
+        _R2_CLIENT = boto3.client(
+            "s3",
+            endpoint_url=endpoint,
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            region_name=os.environ.get("AWS_REGION", "auto"),
+            config=BotoConfig(signature_version="s3v4", s3={"addressing_style": "path"}),
+        )
     return _R2_CLIENT
 
 
@@ -280,6 +345,11 @@ def handle_download():
     [fetch]     /api/fetch/<id>
     [done]
     """
+    if not _is_authorized():
+        if _is_blocked_ua():
+            return jsonify(error="Forbidden"), 403
+        return jsonify(error="Unauthorized"), 401
+
     _cleanup_stale_jobs()
 
     if not _try_acquire_job_slot():
@@ -311,7 +381,14 @@ def handle_download():
         job_dir = _job_dir(job_id)
         os.makedirs(job_dir, exist_ok=True)
 
-        q: "queue.Queue[str]" = queue.Queue(maxsize=5000)
+        # Refuse early if disk is critically low — better than failing mid-download.
+        if _free_disk_mb() < MIN_FREE_DISK_MB:
+            _emergency_cleanup()
+            if _free_disk_mb() < MIN_FREE_DISK_MB:
+                _release_once()
+                return jsonify(error=f"Insufficient disk space. Try again shortly."), 507
+
+        q: "queue.Queue[str]" = queue.Queue(maxsize=50000)
         done = threading.Event()
         result: dict = {"path": None, "error": None, "r2_key": None, "r2_error": None}
 
@@ -359,6 +436,8 @@ def handle_download():
 
             except Exception as e:
                 result["error"] = str(e)
+                # Clean up immediately on failure — don't leave partial files on disk.
+                _schedule_delete_job_dir(job_dir, after_s=0)
             finally:
                 _release_once()
                 done.set()
