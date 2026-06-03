@@ -8,9 +8,10 @@ import shutil
 import threading
 import time
 import mimetypes
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from threading import BoundedSemaphore, Lock
 from typing import Callable
+from urllib.parse import urlparse
 
 import boto3
 from botocore.config import Config as BotoConfig
@@ -37,7 +38,7 @@ MIN_FREE_DISK_MB = int(os.environ.get("YTPDL_MIN_FREE_DISK_MB", "500"))
 CLEANUP_INTERVAL_S = int(os.environ.get("YTPDL_CLEANUP_INTERVAL_S", "60"))
 
 _ALLOWED_EXTENSIONS = {"mp3", "mp4", "best"}
-_BLOCKED_UAS = ("headlesschrome", "headless", "python-requests", "curl", "wget")
+_BLOCKED_UAS = ("headless", "python-requests", "curl", "wget")
 _R2_CLIENT = None
 _R2_CLIENT_LOCK = threading.Lock()
 
@@ -53,6 +54,23 @@ def _is_authorized() -> bool:
     if not VPS_API_TOKEN:
         return True
     return request.headers.get("X-YTPDL-Token", "") == VPS_API_TOKEN
+
+
+def _require_auth():
+    """Return a 401 response if the request is not authorized, else None."""
+    if not _is_authorized():
+        return jsonify(error="Unauthorized"), 401
+    return None
+
+
+def _validate_url(url: str) -> str:
+    """Raise ValueError if url is not a safe public http/https URL."""
+    parsed = urlparse((url or "").strip())
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError(f"Only http/https URLs are allowed (got '{parsed.scheme or 'empty'}')")
+    if not parsed.netloc:
+        raise ValueError("URL must include a host")
+    return url.strip()
 
 
 def _truthy(v: str | None) -> bool:
@@ -245,7 +263,7 @@ class _ProgressState:
     sent: int = 0
     last_emit_t: float = 0.0
     last_pct_int: int = -1
-    lock: Lock = Lock()
+    lock: Lock = field(default_factory=Lock)
 
 
 def _make_r2_progress_cb(
@@ -374,6 +392,12 @@ def handle_download():
             _release_once()
             return jsonify(error="Missing 'url'"), 400
 
+        try:
+            url = _validate_url(url)
+        except ValueError as e:
+            _release_once()
+            return jsonify(error=str(e)), 400
+
         if extension not in _ALLOWED_EXTENSIONS:
             _release_once()
             return jsonify(error=f"Invalid 'extension'. Allowed: {sorted(_ALLOWED_EXTENSIONS)}"), 400
@@ -499,6 +523,9 @@ def handle_download():
 @app.route("/api/fetch/<job_id>", methods=["GET"])
 def fetch_job(job_id: str):
     """Serve the primary output file (concat media file for playlists, single file otherwise)."""
+    auth_error = _require_auth()
+    if auth_error:
+        return auth_error
     job_id = _sanitize_job_id(job_id)
     job_dir = _job_dir(job_id)
     meta = _read_result_meta(job_dir)
@@ -537,6 +564,9 @@ def fetch_job_file(job_id: str, filename: str):
     The frontend uses this to play tracks sequentially in the media player
     while the ZIP is available for bulk download via /api/fetch/<job_id>.
     """
+    auth_error = _require_auth()
+    if auth_error:
+        return auth_error
     job_id = _sanitize_job_id(job_id)
     job_dir = _job_dir(job_id)
 
