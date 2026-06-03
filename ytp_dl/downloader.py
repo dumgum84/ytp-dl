@@ -30,6 +30,7 @@ MODERN_UA = os.environ.get(
 )
 
 FFMPEG_BIN = shutil.which("ffmpeg") or "ffmpeg"
+FFMPEG_TIMEOUT_S = int(os.environ.get("YTPDL_FFMPEG_TIMEOUT_S", "1800"))
 DEFAULT_OUT_DIR = os.environ.get("YTPDL_DOWNLOAD_DIR", "/root")
 
 JOB_TIMEOUT_S = int(os.environ.get("YTPDL_JOB_TIMEOUT_S", "1800"))
@@ -47,10 +48,27 @@ _BOT_RX = re.compile(
     re.IGNORECASE,
 )
 
+# PornHub-specific IP-flagging patterns that should trigger Mullvad rotation.
+# Scoped separately to avoid spurious rotations on other sites where 403/410
+# can mean deleted content or auth required.
+_PH_BOT_RX = re.compile(
+    r"\[PornHub\].*(?:HTTP Error 410|HTTP Error 403|Unable to extract title)",
+    re.IGNORECASE,
+)
+
 
 # SoundCloud is audio-only — used by download_multi_url for per-URL
 # format forcing without relying on the Render-side SC override.
 _SC_URL_RE = re.compile(r"soundcloud\.com", re.IGNORECASE)
+
+# PornHub blocks non-browser TLS fingerprints (HTTP 410/403).
+# --impersonate chrome (via curl_cffi) works around this.
+_PH_URL_RE = re.compile(r"pornhub\.com", re.IGNORECASE)
+try:
+    import curl_cffi as _curl_cffi  # noqa: F401
+    _CURL_CFFI_AVAILABLE = True
+except ImportError:
+    _CURL_CFFI_AVAILABLE = False
 
 # =========================
 # Mullvad state (module-level, shared across all threads)
@@ -59,13 +77,29 @@ _mullvad_lock = threading.Lock()
 _mullvad_connected = False
 
 
+def _mullvad_is_actually_connected() -> bool:
+    """Check live Mullvad status — guards against external disconnects."""
+    if not _mullvad_present():
+        return True
+    try:
+        res = subprocess.run(
+            ["mullvad", "status"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=5,
+        )
+        return "Connected" in (res.stdout or "")
+    except Exception:
+        return False
+
+
 def _ensure_mullvad() -> None:
-    """Connect to Mullvad only if not already connected. Thread-safe."""
+    """Connect to Mullvad only if not already connected. Thread-safe.
+    Re-validates live status so external disconnects (reboot, daemon restart)
+    are caught rather than silently using an unprotected connection."""
     global _mullvad_connected
-    if _mullvad_connected:
+    if _mullvad_connected and _mullvad_is_actually_connected():
         return
     with _mullvad_lock:
-        if _mullvad_connected:
+        if _mullvad_connected and _mullvad_is_actually_connected():
             return
         require_mullvad_login()
         mullvad_connect(MULLVAD_LOCATION)
@@ -88,7 +122,10 @@ def _rotate_mullvad() -> None:
 # Shell helpers
 # =========================
 def _run_argv_capture(argv: List[str]) -> Tuple[int, str]:
-    res = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    res = subprocess.run(
+        argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, timeout=FFMPEG_TIMEOUT_S,
+    )
     return res.returncode, (res.stdout or "")
 
 
@@ -415,6 +452,11 @@ def _build_ytdlp_argv(
         if merge_output_format:
             argv.extend(["--merge-output-format", merge_output_format])
 
+    # PornHub blocks non-browser TLS fingerprints (HTTP 410/403 errors).
+    # Requires curl_cffi: included via yt-dlp[default,curl-cffi] in requirements.txt
+    if _PH_URL_RE.search(url) and _CURL_CFFI_AVAILABLE:
+        argv.extend(["--impersonate", "chrome"])
+
     argv.append(url)
     return argv
 
@@ -509,7 +551,7 @@ def _download_with_format_stream(
                 break
 
             # Bot detection — rotate IP immediately so Render's retry gets a fresh IP.
-            if _BOT_RX.search(s):
+            if _BOT_RX.search(s) or _PH_BOT_RX.search(s):
                 if abort_event is not None:
                     if not abort_event.is_set():
                         abort_event.set()
@@ -570,7 +612,7 @@ def _download_with_format_stream(
 
         if not found and rc != 0:
             raise RuntimeError(
-                f"yt-dlp failed (playlist, format: {fmt})\n{_tail(chr(10).join(tail_lines))}"
+                f"yt-dlp failed (playlist, format: {fmt})\n{_tail('\n'.join(tail_lines))}"
             )
         return found
 
@@ -635,7 +677,8 @@ def _concatenate_files(files: List[str], output_path: str) -> str:
         cmd.append(output_path)
 
         result = subprocess.run(cmd, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True)
+                                stderr=subprocess.STDOUT, text=True,
+                                timeout=FFMPEG_TIMEOUT_S)
         if result.returncode != 0:
             raise RuntimeError(f"ffmpeg concat failed:\n{(result.stdout or '')[-2000:]}")
         return output_path
@@ -712,7 +755,8 @@ def _concatenate_audio_only(files: List[str], output_path: str) -> str:
         output_path,
     ]
 
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, timeout=FFMPEG_TIMEOUT_S)
     if result.returncode != 0:
         raise RuntimeError(f"Audio concat failed:\n{(result.stdout or '')[-2000:]}")
     return output_path
@@ -749,7 +793,6 @@ def download_playlist(
 
     # Emit total item count before downloading so the frontend can scale
     # the progress bar correctly from the very first track.
-    _orig_on_line_pre = on_line
     _item_count = _get_url_item_count(url)
     on_line(f"[total_items] {_item_count}")
 
@@ -774,7 +817,7 @@ def download_playlist(
                 _expected_count.append(int(line.split(None, 1)[1].strip()))
             except Exception:
                 pass
-        if _BOT_RX.search(line) and not abort_event.is_set():
+        if (_BOT_RX.search(line) or _PH_BOT_RX.search(line)) and not abort_event.is_set():
             abort_event.set()
             _rotate_mullvad()
             _orig_on_line("[info] Rate limited — rotating VPN IP and retrying")
@@ -799,19 +842,35 @@ def download_playlist(
                     abort_event=abort_event, archive_path=archive_path,
                 )
             except Exception:
+                try:
+                    files = _download_with_format_stream(
+                        url=url, out_dir=out_dir, fmt=_fmt_mp4_apple_safe(cap),
+                        merge_output_format="mp4", extract_mp3=False,
+                        on_line=on_line, playlist=True,
+                        abort_event=abort_event, archive_path=archive_path,
+                    )
+                except Exception:
+                    files = _download_with_format_stream(
+                        url=url, out_dir=out_dir, fmt="bestvideo+bestaudio/best",
+                        merge_output_format="mp4", extract_mp3=False,
+                        on_line=on_line, playlist=True,
+                        abort_event=abort_event, archive_path=archive_path,
+                    )
+        else:  # mp4
+            try:
                 files = _download_with_format_stream(
                     url=url, out_dir=out_dir, fmt=_fmt_mp4_apple_safe(cap),
                     merge_output_format="mp4", extract_mp3=False,
                     on_line=on_line, playlist=True,
                     abort_event=abort_event, archive_path=archive_path,
                 )
-        else:  # mp4
-            files = _download_with_format_stream(
-                url=url, out_dir=out_dir, fmt=_fmt_mp4_apple_safe(cap),
-                merge_output_format="mp4", extract_mp3=False,
-                on_line=on_line, playlist=True,
-                abort_event=abort_event, archive_path=archive_path,
-            )
+            except Exception:
+                files = _download_with_format_stream(
+                    url=url, out_dir=out_dir, fmt="bestvideo+bestaudio/best",
+                    merge_output_format="mp4", extract_mp3=False,
+                    on_line=on_line, playlist=True,
+                    abort_event=abort_event, archive_path=archive_path,
+                )
 
         # If the IP was rate-limited, raise so Render's retry loop fires and
         # cycles Mullvad. The archive file means the retry picks up where we left off.
@@ -865,19 +924,35 @@ def download_playlist(
                             abort_event=fill_abort, archive_path=archive_path,
                         )
                     except Exception:
+                        try:
+                            files = _download_with_format_stream(
+                                url=url, out_dir=out_dir, fmt=_fmt_mp4_apple_safe(cap),
+                                merge_output_format="mp4", extract_mp3=False,
+                                on_line=on_line, playlist=True,
+                                abort_event=fill_abort, archive_path=archive_path,
+                            )
+                        except Exception:
+                            files = _download_with_format_stream(
+                                url=url, out_dir=out_dir, fmt="bestvideo+bestaudio/best",
+                                merge_output_format="mp4", extract_mp3=False,
+                                on_line=on_line, playlist=True,
+                                abort_event=fill_abort, archive_path=archive_path,
+                            )
+                else:
+                    try:
                         files = _download_with_format_stream(
                             url=url, out_dir=out_dir, fmt=_fmt_mp4_apple_safe(cap),
                             merge_output_format="mp4", extract_mp3=False,
                             on_line=on_line, playlist=True,
                             abort_event=fill_abort, archive_path=archive_path,
                         )
-                else:
-                    files = _download_with_format_stream(
-                        url=url, out_dir=out_dir, fmt=_fmt_mp4_apple_safe(cap),
-                        merge_output_format="mp4", extract_mp3=False,
-                        on_line=on_line, playlist=True,
-                        abort_event=fill_abort, archive_path=archive_path,
-                    )
+                    except Exception:
+                        files = _download_with_format_stream(
+                            url=url, out_dir=out_dir, fmt="bestvideo+bestaudio/best",
+                            merge_output_format="mp4", extract_mp3=False,
+                            on_line=on_line, playlist=True,
+                            abort_event=fill_abort, archive_path=archive_path,
+                        )
             except RuntimeError:
                 raise  # propagate rate-limit kills to Render's retry system
             except Exception as e:
@@ -957,7 +1032,7 @@ def download_multi_url(
     all_files: List[str] = []
 
     def _on_line_intercepted(line: str) -> None:
-        if _BOT_RX.search(line) and not shared_abort.is_set():
+        if (_BOT_RX.search(line) or _PH_BOT_RX.search(line)) and not shared_abort.is_set():
             shared_abort.set()
             _rotate_mullvad()
             on_line("[info] Rate limited — rotating VPN IP and retrying")
@@ -997,9 +1072,15 @@ def download_multi_url(
                 try:
                     files = _run(url, url_dir, is_pl, _fmt_best(cap), None, False, ua)
                 except Exception:
-                    files = _run(url, url_dir, is_pl, _fmt_mp4_apple_safe(cap), "mp4", False, ua)
+                    try:
+                        files = _run(url, url_dir, is_pl, _fmt_mp4_apple_safe(cap), "mp4", False, ua)
+                    except Exception:
+                        files = _run(url, url_dir, is_pl, "bestvideo+bestaudio/best", "mp4", False, ua)
             else:
-                files = _run(url, url_dir, is_pl, _fmt_mp4_apple_safe(cap), "mp4", False, ua)
+                try:
+                    files = _run(url, url_dir, is_pl, _fmt_mp4_apple_safe(cap), "mp4", False, ua)
+                except Exception:
+                    files = _run(url, url_dir, is_pl, "bestvideo+bestaudio/best", "mp4", False, ua)
 
             if ua.is_set():
                 raise RuntimeError("Rate limited — retrying with fresh VPN IP.")
@@ -1016,9 +1097,15 @@ def download_multi_url(
                             try:
                                 files = _run(url, url_dir, True, _fmt_best(cap), None, False, pa)
                             except Exception:
-                                files = _run(url, url_dir, True, _fmt_mp4_apple_safe(cap), "mp4", False, pa)
+                                try:
+                                    files = _run(url, url_dir, True, _fmt_mp4_apple_safe(cap), "mp4", False, pa)
+                                except Exception:
+                                    files = _run(url, url_dir, True, "bestvideo+bestaudio/best", "mp4", False, pa)
                         else:
-                            files = _run(url, url_dir, True, _fmt_mp4_apple_safe(cap), "mp4", False, pa)
+                            try:
+                                files = _run(url, url_dir, True, _fmt_mp4_apple_safe(cap), "mp4", False, pa)
+                            except Exception:
+                                files = _run(url, url_dir, True, "bestvideo+bestaudio/best", "mp4", False, pa)
                     except RuntimeError:
                         raise
                     except Exception:
@@ -1097,13 +1184,25 @@ def download_video(
                     merge_output_format=None, extract_mp3=False, on_line=on_line,
                 )
             except Exception:
-                return _download_with_format_stream(
-                    url=url, out_dir=out_dir, fmt=_fmt_mp4_apple_safe(cap),
-                    merge_output_format="mp4", extract_mp3=False, on_line=on_line,
-                )
-        return _download_with_format_stream(
-            url=url, out_dir=out_dir, fmt=_fmt_mp4_apple_safe(cap),
-            merge_output_format="mp4", extract_mp3=False, on_line=on_line,
-        )
+                try:
+                    return _download_with_format_stream(
+                        url=url, out_dir=out_dir, fmt=_fmt_mp4_apple_safe(cap),
+                        merge_output_format="mp4", extract_mp3=False, on_line=on_line,
+                    )
+                except Exception:
+                    return _download_with_format_stream(
+                        url=url, out_dir=out_dir, fmt="bestvideo+bestaudio/best",
+                        merge_output_format="mp4", extract_mp3=False, on_line=on_line,
+                    )
+        try:
+            return _download_with_format_stream(
+                url=url, out_dir=out_dir, fmt=_fmt_mp4_apple_safe(cap),
+                merge_output_format="mp4", extract_mp3=False, on_line=on_line,
+            )
+        except Exception:
+            return _download_with_format_stream(
+                url=url, out_dir=out_dir, fmt="bestvideo+bestaudio/best",
+                merge_output_format="mp4", extract_mp3=False, on_line=on_line,
+            )
     finally:
         pass  # VPN stays connected — never disconnect mid-service
