@@ -15,12 +15,12 @@ Privacy-focused media downloader API for Linux VPS deployments — powered by yt
 - Smart quality selection: prefers 1080p H.264 + AAC (no transcoding)
 - Best format mode: let yt-dlp pick the highest quality available (adaptive, no transcoding)
 - Audio extraction: downloads best audio stream as MP3 with embedded cover art and metadata (re-encodes only when the source isn't already MP3)
-- Playlist support: YouTube playlists, SoundCloud sets, Bilibili series, Odysee playlists — downloads all tracks, produces a concatenated media file and a ZIP of individual tracks
+- Playlist support: YouTube playlists, SoundCloud sets, Bilibili series, Odysee playlists — downloads all tracks and produces a ZIP of the individual files
 - Streaming HTTP API:
   - `POST /api/download` streams real-time yt-dlp output as Server-Sent Events (SSE)
   - `GET  /api/fetch/<job_id>` fetches the finished file
   - `GET  /api/fetch/<job_id>/<filename>` fetches a specific file from a job by name
-- Optional R2 upload: upload completed files to Cloudflare R2 and emit `data: [r2] key=<object_key>`
+- Optional R2 upload: upload completed files to Cloudflare R2 and emit `data: [r2] key=<object_key>` — playlist/multi jobs also upload every individual track, announced via `data: [r2_track] key=<object_key>`
 - Stable public API under VPN cycling: exclude the API port from the tunnel (nftables marks) + policy routing
 - VPS-ready: automated installer script for Ubuntu
 
@@ -29,7 +29,7 @@ Privacy-focused media downloader API for Linux VPS deployments — powered by yt
 ## Installation
 
 ```bash
-pip install ytp-dl==2026.5.28
+pip install ytp-dl==2026.6.9
 ```
 
 ### Requirements
@@ -217,9 +217,8 @@ _START_JOB_RX = re.compile(r"\[start\]\s+job_id=([A-Za-z0-9_\-]+)")
 _SUPPRESS_PREFIXES = (
     "[playlist_count] ",
     "[playlist_title] ",
-    "[zip_file] ",
-    "[zip_fetch] ",
-    "[zip_download] ",
+    "[r2_track] ",
+    "[r2_tracks_incomplete]",
     "[ready] ",
     "[file] ",
 )
@@ -299,9 +298,9 @@ def stream_logs_and_get_fetch_path(
     """
     Stream SSE logs from the VPS download endpoint.
 
-    Returns (fetch_path, resolved_job_id, error_msg, zip_filename).
+    Returns (fetch_path, resolved_job_id, error_msg).
     error_msg is non-None when the server emitted [error].
-    zip_filename is non-None for playlist downloads.
+    For playlists the fetched file is the ZIP of individual tracks.
     """
     payload: dict = {"url": cfg.url, "extension": cfg.extension, "job_id": cfg.job_id}
     if cfg.resolution is not None:
@@ -312,7 +311,6 @@ def stream_logs_and_get_fetch_path(
     fetch_path: Optional[str] = None
     resolved_job_id: str = cfg.job_id
     error_msg: Optional[str] = None
-    zip_filename: Optional[str] = None
 
     with requests.post(
         f"{cfg.base}/api/download",
@@ -341,11 +339,6 @@ def stream_logs_and_get_fetch_path(
             if jid:
                 resolved_job_id = jid
 
-            # Capture ZIP filename — use this instead of concat for CLI fetch.
-            if msg.startswith("[zip_file] "):
-                zip_filename = msg[len("[zip_file] "):].strip() or zip_filename
-                continue
-
             # Capture fetch hint.
             if not fetch_path:
                 fp = _parse_fetch_path(msg)
@@ -368,7 +361,7 @@ def stream_logs_and_get_fetch_path(
 
             print(msg, flush=True)
 
-    return fetch_path, resolved_job_id, error_msg, zip_filename
+    return fetch_path, resolved_job_id, error_msg
 
 
 def fetch_file(cfg: Config, fetch_path: str) -> str:
@@ -450,7 +443,7 @@ def main(argv: list[str]) -> int:
         attempt += 1
 
         try:
-            fetch_path, resolved_job_id, error_msg, zip_filename = stream_logs_and_get_fetch_path(cfg)
+            fetch_path, resolved_job_id, error_msg = stream_logs_and_get_fetch_path(cfg)
         except requests.RequestException as e:
             print(f"ERROR: Request failed: {e}", file=sys.stderr)
             return 1
@@ -479,10 +472,6 @@ def main(argv: list[str]) -> int:
 
     if not fetch_path:
         fetch_path = f"/api/fetch/{resolved_job_id}"
-
-    # For playlists, fetch the ZIP instead of the concat file.
-    if zip_filename:
-        fetch_path = f"/api/fetch/{resolved_job_id}/{zip_filename}"
 
     try:
         out = fetch_file(cfg, fetch_path)
@@ -522,8 +511,7 @@ These are read from `/etc/default/ytp-dl-api`. You can also export any of them b
 | `YTPDL_VENV` | Path to virtualenv for ytp-dl | `/opt/yt-dlp-mullvad/venv` |
 | `YTPDL_MULLVAD_LOCATION` | Mullvad relay location code | `us` |
 | `YTPDL_MAX_CONCURRENT` | Maximum concurrent download jobs | `1` |
-| `YTPDL_DONE_TTL_S` | Seconds to keep a completed single-file job dir before deletion | `300` |
-| `YTPDL_PLAYLIST_DONE_TTL_S` | Seconds to keep a completed playlist job dir before deletion (longer to allow fetching both output files) | `600` |
+| `YTPDL_DONE_TTL_S` | Seconds to keep a completed job dir before deletion | `300` |
 | `YTPDL_STALE_JOB_TTL_S` | Seconds before an unfinished/unfetched job dir is force-deleted | `3600` |
 | `YTPDL_MIN_FREE_DISK_MB` | Minimum free disk MB — new jobs refused and emergency cleanup triggered below this threshold | `500` |
 | `YTPDL_CLEANUP_INTERVAL_S` | How often the background cleanup thread runs in seconds | `60` |
@@ -585,13 +573,14 @@ Response — `200 OK` SSE stream (`text/event-stream`):
 
 ```
 data: [start] job_id=<job_id>
+data: [total_items] <n>               # playlist/multi only — track count
 data: <yt-dlp output lines>
-data: [zip_file] <zip filename>       # playlist only — ZIP available on VPS
+data: [r2_upload] XX.XX%              # R2 only — per track, then the result file
+data: [r2_track] key=<object_key>     # R2 + playlist/multi only — one per uploaded track
+data: [r2_tracks_incomplete]          # R2 + playlist/multi only — a track upload failed
 data: [ready] job_id=<job_id>
-data: [file] <filename>
-data: [r2_upload] XX.XX%              # if R2 enabled on VPS
-data: [r2] key=<object_key>           # if R2 enabled on VPS
-data: [zip_download] <zip filename>   # playlist only — ZIP uploaded to R2
+data: [file] <filename>               # the media file — or the ZIP name for playlists
+data: [r2] key=<object_key>           # R2 only — the result file's key
 data: [fetch] /api/fetch/<job_id>
 data: [done]
 ```
@@ -602,7 +591,7 @@ Other responses:
 
 ### `GET /api/fetch/<job_id>`
 
-Returns the finished file as an attachment. The job directory is cleaned up after the response completes (or after `YTPDL_DONE_TTL_S` / `YTPDL_PLAYLIST_DONE_TTL_S` elapses).
+Returns the finished file as an attachment. The job directory is cleaned up after the response completes (or after `YTPDL_DONE_TTL_S` elapses).
 
 ### `GET /api/fetch/<job_id>/<filename>`
 
@@ -830,7 +819,7 @@ python3 -m venv "${VENV_DIR}"
 source "${VENV_DIR}/bin/activate"
 pip install --upgrade pip
 
-pip install "ytp-dl==2026.5.28"
+pip install "ytp-dl==2026.6.9"
 if [[ "${YTPDL_R2_UPLOAD}" == "1" ]]; then
   pip install boto3
 fi
