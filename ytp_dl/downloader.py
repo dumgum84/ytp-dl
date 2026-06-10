@@ -429,7 +429,7 @@ def _build_ytdlp_argv(
         argv.extend(["--print", "before_dl:[playlist_count] %(playlist_count)s"])
         # Prevent titles with "/" from creating subdirectories.
         argv.append("--windows-filenames")
-        # Never let yt-dlp auto-concat multi-part entries — we do our own.
+        # Never auto-concat multi-part entries — we ship individual tracks.
         argv.extend(["--concat-playlist", "never"])
         # Continue if one entry in the playlist fails.
         argv.append("--ignore-errors")
@@ -593,7 +593,7 @@ def _download_with_format_stream(
         # PREVIOUS retry runs too.  Those were recorded in --download-archive
         # and silently skipped by yt-dlp this run, so they never appeared in
         # `candidates` — meaning a naive candidates-only approach would omit
-        # them from the ZIP/concat on every retry.
+        # them from the ZIP on every retry.
         _SKIP_EXTS = (".part", ".ytdl", ".tmp", ".zip", ".json", ".txt", ".filelist.txt")
         try:
             dir_entries = []
@@ -656,113 +656,6 @@ def _create_zip(files: List[str], zip_path: str) -> str:
 
 
 # =========================
-# Concat helper
-# =========================
-def _concatenate_files(files: List[str], output_path: str) -> str:
-    """
-    Concatenate media files losslessly with ffmpeg concat demuxer.
-    For MP4, adds faststart so the browser can play before full download.
-    """
-    filelist_path = output_path + ".filelist.txt"
-    try:
-        with open(filelist_path, "w", encoding="utf-8") as f:
-            for path in files:
-                escaped = os.path.abspath(path).replace("'", "'\\''")
-                f.write(f"file '{escaped}'\n")
-
-        cmd = [FFMPEG_BIN, "-y", "-f", "concat", "-safe", "0",
-               "-i", filelist_path, "-c", "copy"]
-        if output_path.lower().endswith(".mp4"):
-            cmd += ["-movflags", "+faststart"]
-        cmd.append(output_path)
-
-        result = subprocess.run(cmd, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True,
-                                timeout=FFMPEG_TIMEOUT_S)
-        if result.returncode != 0:
-            raise RuntimeError(f"ffmpeg concat failed:\n{(result.stdout or '')[-2000:]}")
-        return output_path
-    finally:
-        try:
-            os.remove(filelist_path)
-        except Exception:
-            pass
-
-
-# =========================
-# Codec compatibility helpers
-# =========================
-def _probe_video_codec(path: str) -> "Optional[str]":
-    """Return the first video stream codec name, or None if audio-only."""
-    try:
-        r = subprocess.run(
-            [
-                "ffprobe", "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=codec_name",
-                "-of", "default=noprint_wrappers=1:nokey=1",
-                path,
-            ],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, timeout=10,
-        )
-        lines = (r.stdout or "").strip().splitlines()
-        return lines[0].strip() if lines else None
-    except Exception:
-        return None
-
-
-def _concat_compatible(files: List[str]) -> bool:
-    """
-    Return True when all files can be losslessly concatenated with the
-    ffmpeg concat demuxer — i.e. they all share the same container
-    extension AND the same video codec (or are all audio-only with the
-    same extension). Mixed extensions or codecs require re-encoding.
-    """
-    if not files:
-        return False
-    exts = {os.path.splitext(p)[1].lower() for p in files}
-    if len(exts) > 1:
-        return False  # mixed containers (e.g. .mp4 + .mp3)
-    codecs = {_probe_video_codec(p) for p in files}
-    return len(codecs) == 1  # all same codec, including all-None (audio-only)
-
-
-def _concatenate_audio_only(files: List[str], output_path: str) -> str:
-    """
-    Extract audio from every file and concatenate into a single MP3 using
-    ffmpeg's concat filter. Unlike the concat demuxer, the filter re-encodes
-    all inputs into one uniform audio stream, guaranteeing seamless playback
-    regardless of differing sample rates, bitrates, or codecs across sources
-    (e.g. TikTok AAC vs YouTube AAC at different sample rates).
-    The original files are never modified — this only builds the preview.
-    """
-    if not files:
-        raise RuntimeError("No files to concatenate.")
-
-    # Build: -i f1 -i f2 ... -filter_complex [0:a][1:a]concat=n=N:v=0:a=1[aout]
-    cmd = [FFMPEG_BIN, "-y"]
-    for f in files:
-        cmd += ["-i", f]
-    n = len(files)
-    filter_inputs = "".join(f"[{i}:a]" for i in range(n))
-    filter_complex = f"{filter_inputs}concat=n={n}:v=0:a=1[aout]"
-    cmd += [
-        "-filter_complex", filter_complex,
-        "-map", "[aout]",
-        "-acodec", "libmp3lame",
-        "-q:a", "0",          # VBR best quality
-        output_path,
-    ]
-
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, timeout=FFMPEG_TIMEOUT_S)
-    if result.returncode != 0:
-        raise RuntimeError(f"Audio concat failed:\n{(result.stdout or '')[-2000:]}")
-    return output_path
-
-
-# =========================
 # Playlist downloader
 # =========================
 def download_playlist(
@@ -776,9 +669,8 @@ def download_playlist(
     """
     Download every track in a playlist.
 
-    Returns path to a concatenated media file.
-    Also creates a named ZIP of individual tracks alongside it and
-    emits [zip_file] <n> so Render can fetch and upload the ZIP.
+    Returns the path to a ZIP of the individual tracks — the job's primary
+    result. The worker uploads each track and the ZIP to R2.
 
     On 429/bot-detection, kills yt-dlp immediately and raises RuntimeError
     so Render's existing retry loop fires and cycles the Mullvad IP.
@@ -973,8 +865,8 @@ def download_playlist(
         stem = _sanitize_filename_stem(title)
 
         # ZIP of individual tracks — returned as primary result.
-        # Render extracts it, uploads individual files for sequential playback,
-        # and re-uploads the ZIP for the download button. No concat needed.
+        # The worker uploads each track to R2 (sequential playback) and the
+        # ZIP (download button); Render just records the announced keys.
         zip_path = os.path.join(out_dir, f"{stem}.zip")
         _create_zip(files, zip_path)
 
@@ -999,18 +891,8 @@ def download_multi_url(
 
     Each URL downloads into its own subdirectory to prevent filename
     collisions. Playlist URLs are expanded with the same fill-in passes as
-    download_playlist. All collected files are ZIPped as multi_url.zip.
-
-    Codec compatibility is checked after all downloads complete:
-      - All files share the same container AND video codec (or are all
-        audio-only) -> lossless concat as multi_url.<ext>, ZIP is sibling.
-      - Mixed codecs / containers -> audio is extracted and re-encoded to
-        MP3 (fast, seconds per track), concatenated as multi_url.mp3.
-        [concat_mode] audio_only is emitted so the frontend knows to use
-        the audio player. ZIP still contains all original files.
-
-    In both cases the frontend receives a playable file and a downloadable
-    ZIP — the difference is just video player vs audio player.
+    download_playlist. All collected files are ZIPped as multi_url.zip,
+    which is returned as the job's primary result.
     """
     out_dir = os.path.abspath(out_dir)
     os.makedirs(out_dir, exist_ok=True)
@@ -1121,9 +1003,9 @@ def download_multi_url(
             raise RuntimeError("No files could be downloaded from the provided URLs.")
 
         # ZIP all files — returned as primary result.
-        # Render extracts it, uploads individual files for sequential playback,
-        # and re-uploads the ZIP for the download button. No concat needed,
-        # so codec differences between URLs are not an issue.
+        # The worker uploads each track to R2 (sequential playback) and the
+        # ZIP (download button); Render just records the announced keys.
+        # Codec differences between URLs are not an issue.
         zip_path = os.path.join(out_dir, "multi_url.zip")
         _create_zip(all_files, zip_path)
 
