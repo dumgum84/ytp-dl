@@ -7,6 +7,7 @@ import queue
 import shutil
 import threading
 import time
+import zipfile
 import mimetypes
 from dataclasses import dataclass, field
 from threading import BoundedSemaphore, Lock
@@ -323,21 +324,61 @@ def _upload_to_r2(
     return key
 
 
-# ─── Playlist ZIP sibling helper ─────────────────────────────────────────────
+# ─── Playlist track upload helpers ───────────────────────────────────────────
 
-def _zip_sibling(result_path: str) -> str | None:
-    """Return the ZIP basename if one exists alongside the result file.
-    Returns None when the result IS a zip (no separate sibling exists)."""
-    if not result_path:
-        return None
-    # If the primary result is itself a ZIP, there is no sibling.
-    if result_path.lower().endswith(".zip"):
-        return None
-    stem, _ = os.path.splitext(result_path)
-    zip_path = stem + ".zip"
-    if os.path.isfile(zip_path):
-        return os.path.basename(zip_path)
-    return None
+def _collect_track_files(job_dir: str, zip_path: str) -> list[str]:
+    """
+    Find the individual media files of a playlist/multi-URL job on disk,
+    restricted to files that are actually members of the job's ZIP — so the
+    uploaded track set is exactly what extracting the ZIP would yield.
+    (_create_zip stores members by basename, and these are the same source
+    files.) Stray artifacts in the job dir are ignored.
+    """
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            members = {os.path.basename(n) for n in zf.namelist()}
+    except Exception:
+        members = set()
+    if not members:
+        return []
+
+    out: list[str] = []
+    zip_abs = os.path.abspath(zip_path)
+    for root, dirs, files in os.walk(job_dir):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for n in files:
+            if n not in members:
+                continue
+            p = os.path.join(root, n)
+            if os.path.abspath(p) == zip_abs:
+                continue
+            out.append(p)
+    return sorted(out, key=lambda p: os.path.basename(p).lower())
+
+
+def _upload_playlist_tracks(*, job_dir: str, zip_path: str, job_id: str, push) -> bool:
+    """
+    Upload each individual track to R2 and emit [r2_track] key=<key> per
+    success so Render can map tracks without fetching/extracting the ZIP.
+    Returns True when every track uploaded; on any failure emits
+    [r2_tracks_incomplete] so Render falls back to its fetch+extract path.
+    """
+    ok = True
+    for p in _collect_track_files(job_dir, zip_path):
+        name = os.path.basename(p)
+        try:
+            def _pct(v: float) -> None:
+                push(f"[r2_upload] {v:.2f}%")
+            key = _upload_to_r2(local_path=p, job_id=job_id, filename=name, on_progress=_pct)
+            push("[r2_upload] 100.00%")
+            push(f"[r2_track] key={key}")
+        except Exception as e:
+            ok = False
+            push(f"[r2_error] Track upload failed ({name}): {e}")
+    if not ok:
+        push("[r2_tracks_incomplete]")
+    return ok
+
 
 
 # ─── Routes ──────────────────────────────────────────────────────────────────
@@ -347,20 +388,23 @@ def handle_download():
     """
     Streams real-time yt-dlp stdout as SSE events.
 
-    For playlists, creates a concat file (player preview) + ZIP (individual
-    tracks). The ZIP is kept for YTPDL_PLAYLIST_DONE_TTL_S seconds (default
-    600) so Render can fetch it before cleanup.
+    Single URLs produce one media file. Playlists / multi-URL jobs produce a
+    ZIP of individual tracks as the primary result; with R2 enabled, every
+    track is uploaded to R2 (announced via [r2_track]) before the ZIP itself,
+    so the client never needs to fetch + extract the ZIP.
 
     SSE event summary
     -----------------
-    [start]     job_id=<id>
+    [start]      job_id=<id>
+    [total_items] <n>            (playlist/multi only)
     <yt-dlp lines>
-    [zip_file]  <zip filename>   (playlist only)
-    [ready]     job_id=<id>
-    [file]      <concat filename>
-    [r2_upload] XX.XX%           (if R2 enabled on VPS)
-    [r2]        key=<key>        (if R2 enabled on VPS)
-    [fetch]     /api/fetch/<id>
+    [r2_upload]  XX.XX%          (R2 only - per track, then the result file)
+    [r2_track]   key=<key>       (R2 + playlist/multi only - one per track)
+    [r2_tracks_incomplete]       (R2 + playlist/multi only - a track failed)
+    [ready]      job_id=<id>
+    [file]       <filename>      (the media file, or the ZIP for playlists)
+    [r2]         key=<key>       (R2 only - the result file's key)
+    [fetch]      /api/fetch/<id>
     [done]
     """
     if not _is_authorized():
@@ -437,6 +481,14 @@ def handle_download():
                     try:
                         fname = os.path.basename(path) if path else ""
                         if fname:
+                            # Playlist/multi result is a ZIP: upload the
+                            # individual tracks first and announce their keys
+                            # so Render never needs to fetch + extract the ZIP.
+                            if fname.lower().endswith(".zip"):
+                                _upload_playlist_tracks(
+                                    job_dir=job_dir, zip_path=path,
+                                    job_id=job_id, push=push,
+                                )
                             def _on_pct(pct: float) -> None:
                                 push(f"[r2_upload] {pct:.2f}%")
                             result["r2_key"] = _upload_to_r2(
@@ -451,12 +503,7 @@ def handle_download():
 
                 _write_result_meta(job_dir, path, r2_key=result.get("r2_key"))
 
-                # Use a longer TTL when a playlist ZIP sibling exists so
-                # Render has time to make a second fetch for the ZIP.
-                zip_name = _zip_sibling(path)
-                result["zip_name"] = zip_name
-                ttl = int(os.environ.get("YTPDL_PLAYLIST_DONE_TTL_S", "600")) if zip_name else DONE_TTL_S
-                _schedule_delete_job_dir(job_dir, after_s=ttl)
+                _schedule_delete_job_dir(job_dir, after_s=DONE_TTL_S)
 
             except Exception as e:
                 result["error"] = str(e)
@@ -492,11 +539,6 @@ def handle_download():
             p = result.get("path") or ""
             fname = os.path.basename(p) if p else ""
 
-            # Emit ZIP name so Render can fetch it as a separate file.
-            zip_name = result.get("zip_name")
-            if zip_name:
-                yield f"data: [zip_file] {zip_name}\n\n"
-
             yield f"data: [ready] job_id={job_id}\n\n"
             if fname:
                 yield f"data: [file] {fname}\n\n"
@@ -522,7 +564,7 @@ def handle_download():
 
 @app.route("/api/fetch/<job_id>", methods=["GET"])
 def fetch_job(job_id: str):
-    """Serve the primary output file (concat media file for playlists, single file otherwise)."""
+    """Serve the primary output file (the ZIP for playlists, the media file otherwise)."""
     auth_error = _require_auth()
     if auth_error:
         return auth_error
@@ -544,15 +586,13 @@ def fetch_job(job_id: str):
         download_name=filename,
     )
 
-    # Only delete immediately when there is no ZIP sibling that Render still
-    # needs to fetch.  Playlist jobs use TTL-based deletion instead.
-    if _zip_sibling(path) is None:
-        def _cleanup() -> None:
-            try:
-                shutil.rmtree(job_dir, ignore_errors=True)
-            except Exception:
-                pass
-        response.call_on_close(_cleanup)
+    # The served file is the job's only deliverable — clean up right after.
+    def _cleanup() -> None:
+        try:
+            shutil.rmtree(job_dir, ignore_errors=True)
+        except Exception:
+            pass
+    response.call_on_close(_cleanup)
 
     return response
 
