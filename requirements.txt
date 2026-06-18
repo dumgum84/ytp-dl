@@ -1,4 +1,6 @@
-yt-dlp[default]
+yt-dlp[default,curl-cffi]
 flask
 requests
 gunicorn
+Pillow
+mutagen
