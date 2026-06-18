@@ -324,6 +324,124 @@ def _upload_to_r2(
     return key
 
 
+# ─── Thumbnail (Media Session artwork) helpers ───────────────────────────────
+
+_THUMB_EXTS = (".jpg", ".jpeg", ".png", ".webp")
+
+
+def _find_sidecar_thumb(media_path: str) -> str | None:
+    """
+    Locate the sidecar thumbnail yt-dlp wrote next to a media file.
+
+    --write-thumbnail --convert-thumbnails jpg produces "<stem>.jpg" alongside
+    "<stem>.<media_ext>". We match on the stem and prefer .jpg, falling back to
+    other image extensions in case conversion was skipped (e.g. a source that
+    was already jpg). Returns None when no thumbnail exists.
+    """
+    if not media_path:
+        return None
+    stem, _ = os.path.splitext(media_path)
+    for ext in _THUMB_EXTS:
+        cand = stem + ext
+        if os.path.isfile(cand):
+            return cand
+    # Some extractors append the format id, e.g. "<stem>.<fmt>.jpg". Scan the
+    # directory for any image file sharing the stem prefix as a last resort.
+    try:
+        base = os.path.basename(stem)
+        d = os.path.dirname(media_path) or "."
+        for n in os.listdir(d):
+            low = n.lower()
+            if low.endswith(_THUMB_EXTS) and n.startswith(base):
+                return os.path.join(d, n)
+    except Exception:
+        pass
+    return None
+
+
+def _square_crop(path: str) -> None:
+    """
+    Center-crop an image file to a square, in place. Applied to audio cover art
+    so the iOS lock screen — which renders the sidecar thumbnail URL — shows a
+    clean square instead of a letterboxed 16:9 frame.
+
+    Best-effort: if Pillow is unavailable or the image can't be read, the file
+    is left untouched. Artwork is non-essential and must never break a download.
+    """
+    try:
+        from PIL import Image
+    except Exception:
+        return
+    try:
+        with Image.open(path) as im:
+            im = im.convert("RGB")
+            w, h = im.size
+            if w == h:
+                return
+            side = min(w, h)
+            left = (w - side) // 2
+            top = (h - side) // 2
+            cropped = im.crop((left, top, left + side, top + side))
+        cropped.save(path, "JPEG", quality=90)
+    except Exception:
+        pass
+
+
+def _upload_thumb_for(*, media_path: str, job_id: str, push) -> None:
+    """
+    Upload the sidecar thumbnail for a media file to R2 and emit
+    [meta_thumb] media=<media_filename>\tkey=<key> so Render can correlate the
+    thumbnail to its track and rewrite it into a worker URL for Media Session.
+
+    Best-effort: any failure is silently ignored — artwork is non-essential and
+    must never break a download.
+    """
+    try:
+        thumb = _find_sidecar_thumb(media_path)
+        if not thumb:
+            return
+        if media_path.lower().endswith(".mp3"):
+            _square_crop(thumb)
+        media_name = os.path.basename(media_path)
+        thumb_name = os.path.basename(thumb)
+        key = _upload_to_r2(local_path=thumb, job_id=job_id, filename=thumb_name)
+        push(f"[meta_thumb] media={media_name}\tkey={key}")
+    except Exception:
+        pass
+
+
+def _rewrite_meta_line(line: str) -> str | None:
+    """
+    Convert a raw yt-dlp [meta] print into a clean, path-free SSE line.
+
+    in:  [meta] <abs_filepath>\t<title>\t<artist>
+    out: [meta] media=<basename>\ttitle=<title>\tartist=<artist>
+
+    Returns None if the line can't be parsed (so the caller drops it). Fields
+    that yt-dlp couldn't fill come through as "NA" and are blanked. The server
+    filepath is reduced to its basename so no server paths reach the browser.
+    """
+    try:
+        payload = line[len("[meta] "):]
+        parts = payload.split("\t")
+        if not parts or not parts[0].strip():
+            return None
+        media = os.path.basename(parts[0].strip())
+        title = (parts[1].strip() if len(parts) > 1 else "")
+        artist = (parts[2].strip() if len(parts) > 2 else "")
+        if title.upper() == "NA":
+            title = ""
+        if artist.upper() == "NA":
+            artist = ""
+        # Tabs already delimit fields; titles/artists with stray tabs are
+        # extremely unlikely but collapse them defensively.
+        title = title.replace("\t", " ")
+        artist = artist.replace("\t", " ")
+        return f"[meta] media={media}\ttitle={title}\tartist={artist}"
+    except Exception:
+        return None
+
+
 # ─── Playlist track upload helpers ───────────────────────────────────────────
 
 def _collect_track_files(job_dir: str, zip_path: str) -> list[str]:
@@ -372,6 +490,8 @@ def _upload_playlist_tracks(*, job_dir: str, zip_path: str, job_id: str, push) -
             key = _upload_to_r2(local_path=p, job_id=job_id, filename=name, on_progress=_pct)
             push("[r2_upload] 100.00%")
             push(f"[r2_track] key={key}")
+            # Upload this track's sidecar thumbnail for Media Session artwork.
+            _upload_thumb_for(media_path=p, job_id=job_id, push=push)
         except Exception as e:
             ok = False
             push(f"[r2_error] Track upload failed ({name}): {e}")
@@ -398,8 +518,11 @@ def handle_download():
     [start]      job_id=<id>
     [total_items] <n>            (playlist/multi only)
     <yt-dlp lines>
+    [meta]       media=<name>\ttitle=<t>\tartist=<a>   (per file - lock screen)
     [r2_upload]  XX.XX%          (R2 only - per track, then the result file)
     [r2_track]   key=<key>       (R2 + playlist/multi only - one per track)
+    [meta_thumb] media=<name>\tkey=<key>   (R2 on - artwork uploaded to R2)
+                 media=<name>\tfile=<thumb_filename>  (R2 off - fetch via /api/fetch)
     [r2_tracks_incomplete]       (R2 + playlist/multi only - a track failed)
     [ready]      job_id=<id>
     [file]       <filename>      (the media file, or the ZIP for playlists)
@@ -431,6 +554,18 @@ def handle_download():
         resolution = data.get("resolution")
         extension = (data.get("extension") or "mp4").strip().lower()
         job_id = _sanitize_job_id(str(data.get("job_id") or ""))
+
+        # Per-request Media Session metadata toggle. Absent => OFF (opt-in),
+        # matching yt-dlp's own convention (no extra artifacts unless asked).
+        # When on, the download writes a sidecar thumbnail + emits [meta]
+        # title/artist for lock-screen use; when off, neither is produced
+        # (zero extra cost, and existing API consumers see unchanged behavior).
+        # Accepts a JSON bool or a truthy string ("1"/"true"/"yes"/"on").
+        _meta_raw = data.get("metadata", False)
+        if isinstance(_meta_raw, bool):
+            write_metadata = _meta_raw
+        else:
+            write_metadata = str(_meta_raw).strip().lower() in {"1", "true", "yes", "y", "on"}
 
         if not url:
             _release_once()
@@ -474,6 +609,7 @@ def handle_download():
                     extension=extension,
                     out_dir=job_dir,
                     on_line=push,
+                    write_metadata=write_metadata,
                 )
                 result["path"] = path
 
@@ -498,6 +634,14 @@ def handle_download():
                                 on_progress=_on_pct,
                             )
                             push("[r2_upload] 100.00%")
+                            # Upload the sidecar thumbnail (single-file only;
+                            # playlist tracks handle their own above). Skipped
+                            # automatically for ZIP results since those have no
+                            # sidecar thumbnail of their own.
+                            if not fname.lower().endswith(".zip"):
+                                _upload_thumb_for(
+                                    media_path=path, job_id=job_id, push=push,
+                                )
                     except (BotoCoreError, ClientError, Exception) as e:
                         result["r2_error"] = str(e)
 
@@ -524,6 +668,14 @@ def handle_download():
                     line = q.get(timeout=0.5)
                     if line.startswith("[playlist_title] "):
                         continue
+                    # Rewrite [meta] lines so the server's absolute filepath is
+                    # reduced to a bare filename before leaving the VPS. Format
+                    # in:  [meta] <abs_path>\t<title>\t<artist>
+                    # out: [meta] media=<filename>\ttitle=<title>\tartist=<artist>
+                    if line.startswith("[meta] "):
+                        line = _rewrite_meta_line(line)
+                        if not line:
+                            continue
                     yield f"data: {line}\n\n"
                 except queue.Empty:
                     if (time.monotonic() - last_keepalive) >= 15:
@@ -547,6 +699,34 @@ def handle_download():
                 yield f"data: [r2] key={result['r2_key']}\n\n"
             elif result.get("r2_error"):
                 yield f"data: [r2_error] {result['r2_error']}\n\n"
+
+            # Media Session artwork without R2: the sidecar thumbnail is in the
+            # job dir and served by /api/fetch/<job_id>/<thumb>. Announce it as a
+            # fetchable filename so consumers can build that URL. (With R2 on,
+            # the thumbnail was already uploaded and announced via [meta_thumb]
+            # key=… during the upload phase, so we skip this to avoid dupes.)
+            if not result.get("r2_key") and p:
+                if fname.lower().endswith(".zip"):
+                    # Playlist ZIP: announce each track's sidecar thumbnail by
+                    # name. The tracks (and their thumbs) remain in the job dir
+                    # and are fetchable individually via /api/fetch/<id>/<name>,
+                    # the same way per-track title/artist already arrives via the
+                    # [meta] lines emitted during download.
+                    for track in _collect_track_files(job_dir, p):
+                        t_thumb = _find_sidecar_thumb(track)
+                        if t_thumb:
+                            if track.lower().endswith(".mp3"):
+                                _square_crop(t_thumb)
+                            yield (
+                                f"data: [meta_thumb] media={os.path.basename(track)}"
+                                f"\tfile={os.path.basename(t_thumb)}\n\n"
+                            )
+                else:
+                    thumb = _find_sidecar_thumb(p)
+                    if thumb:
+                        if (p or "").lower().endswith(".mp3"):
+                            _square_crop(thumb)
+                        yield f"data: [meta_thumb] media={fname}\tfile={os.path.basename(thumb)}\n\n"
 
             yield f"data: [fetch] /api/fetch/{job_id}\n\n"
             yield "data: [done]\n\n"
