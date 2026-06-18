@@ -36,6 +36,7 @@ DEFAULT_OUT_DIR = os.environ.get("YTPDL_DOWNLOAD_DIR", "/root")
 JOB_TIMEOUT_S = int(os.environ.get("YTPDL_JOB_TIMEOUT_S", "1800"))
 PLAYLIST_JOB_TIMEOUT_S = int(os.environ.get("YTPDL_PLAYLIST_JOB_TIMEOUT_S", "21600"))
 
+
 _MAX_ERR_LINES = 80
 _MAX_ERR_CHARS = 4000
 
@@ -407,6 +408,7 @@ def _build_ytdlp_argv(
     extract_mp3: bool,
     playlist: bool = False,
     archive_path: Optional[str] = None,
+    write_metadata: bool = False,
 ) -> List[str]:
     out_dir = os.path.abspath(out_dir)
     out_tpl = os.path.join(out_dir, "%(title)s.%(ext)s")
@@ -421,6 +423,21 @@ def _build_ytdlp_argv(
         "--newline",
         "--no-color",
     ]
+
+    # Media Session metadata (lock-screen). Controlled per-request via the
+    # `metadata` API field (write_metadata here; default off, opt-in). Adds a [meta]
+    # print (title/artist, keyed by filepath so playlists correlate per track)
+    # and writes a sidecar JPG thumbnail for ALL formats. --write-thumbnail
+    # writes a SEPARATE file and does NOT remux the video container (unlike
+    # --embed-thumbnail), so it's safe for mp4/webm. The JPG lands next to the
+    # media file; api.py serves it via R2 or /api/fetch.
+    if write_metadata:
+        argv.extend([
+            "--print",
+            "after_move:[meta] %(filepath)s\t%(title)s\t%(artist,uploader,creator,channel)s",
+            "--write-thumbnail",
+            "--convert-thumbnails", "jpg",
+        ])
 
     # For playlists, print the title once so download_playlist can name files.
     if playlist:
@@ -439,14 +456,19 @@ def _build_ytdlp_argv(
 
     if extract_mp3:
         # MP3 only: safe to embed cover art — yt-dlp writes it as an ID3 APIC
-        # tag without touching the container format.
+        # tag without touching the container format. This is independent of the
+        # Media Session feature above (it embeds art into the file itself).
         argv.extend([
             "--extract-audio",
             "--audio-format", "mp3",
             "--audio-quality", "0",
             "--embed-thumbnail",           # cover art in ID3
-            "--convert-thumbnails", "jpg", # webp → jpg before embedding
         ])
+        # Ensure the embedded art is JPG. When metadata is on this is already
+        # present globally; add it here too so MP3 cover art is still converted
+        # when metadata is off. yt-dlp de-dupes repeated flags, so it's harmless.
+        if not write_metadata:
+            argv.extend(["--convert-thumbnails", "jpg"])
     else:
         # Video: no --embed-thumbnail to avoid unwanted container changes.
         if merge_output_format:
@@ -459,6 +481,57 @@ def _build_ytdlp_argv(
 
     argv.append(url)
     return argv
+
+
+# =========================
+# Embedded cover art
+# =========================
+def _square_embedded_cover(mp3_path: str) -> None:
+    """
+    Center-crop the cover art embedded in an MP3 to a square, in place.
+
+    yt-dlp's --embed-thumbnail writes the source thumbnail as-is, so YouTube's
+    16:9 frame ends up as the file's album art — which players like Apple Music
+    render letterboxed. This rewrites only the ID3 APIC frame with a squared
+    JPEG; the audio frames and container are never touched (mutagen edits just
+    the tag region, so there is no re-encode and no quality loss).
+
+    Best-effort: missing deps, no embedded art, an already-square cover, or any
+    failure leaves the file unchanged. Cover art is non-essential and must never
+    break a download.
+    """
+    try:
+        import io
+        from PIL import Image
+        from mutagen.id3 import ID3, APIC
+    except Exception:
+        return
+    try:
+        tags = ID3(mp3_path)
+    except Exception:
+        return  # no ID3 tag / unreadable — nothing to do
+    pics = tags.getall("APIC")
+    if not pics:
+        return
+    try:
+        im = Image.open(io.BytesIO(pics[0].data)).convert("RGB")
+        w, h = im.size
+        if w == h:
+            return  # already square — leave the file as-is
+        side = min(w, h)
+        left = (w - side) // 2
+        top = (h - side) // 2
+        buf = io.BytesIO()
+        im.crop((left, top, left + side, top + side)).save(buf, "JPEG", quality=90)
+        data = buf.getvalue()
+    except Exception:
+        return
+    try:
+        tags.delall("APIC")
+        tags.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=data))
+        tags.save(mp3_path, v2_version=3)
+    except Exception:
+        pass
 
 
 # =========================
@@ -475,6 +548,7 @@ def _download_with_format_stream(
     playlist: bool = False,
     abort_event: Optional[threading.Event] = None,
     archive_path: Optional[str] = None,
+    write_metadata: bool = False,
 ) -> "str | List[str]":
     """
     Streams yt-dlp stdout line-by-line via on_line.
@@ -491,6 +565,7 @@ def _download_with_format_stream(
         merge_output_format=merge_output_format,
         extract_mp3=extract_mp3, playlist=playlist,
         archive_path=archive_path,
+        write_metadata=write_metadata,
     )
 
     tail_lines: Deque[str] = deque(maxlen=_MAX_ERR_LINES)
@@ -594,7 +669,13 @@ def _download_with_format_stream(
         # and silently skipped by yt-dlp this run, so they never appeared in
         # `candidates` — meaning a naive candidates-only approach would omit
         # them from the ZIP on every retry.
-        _SKIP_EXTS = (".part", ".ytdl", ".tmp", ".zip", ".json", ".txt", ".filelist.txt")
+        # Sidecar thumbnails (.jpg from --write-thumbnail/--convert-thumbnails,
+        # plus any un-converted .webp/.png) are NOT tracks — exclude them so they
+        # never end up in the track list, the ZIP, or the playback queue. They're
+        # still uploaded as Media Session artwork separately (api.py finds each
+        # sidecar by its media file's stem, independently of this scan).
+        _SKIP_EXTS = (".part", ".ytdl", ".tmp", ".zip", ".json", ".txt", ".filelist.txt",
+                      ".jpg", ".jpeg", ".png", ".webp")
         try:
             dir_entries = []
             for n in os.listdir(out_dir):
@@ -614,17 +695,26 @@ def _download_with_format_stream(
             raise RuntimeError(
                 f"yt-dlp failed (playlist, format: {fmt})\n{_tail('\n'.join(tail_lines))}"
             )
+        if extract_mp3:
+            for _f in found:
+                _square_embedded_cover(_f)
         return found
 
     # ---- Single file mode ----
     for p in reversed(candidates):
         if p and os.path.exists(p):
-            return os.path.abspath(p)
+            ap = os.path.abspath(p)
+            if extract_mp3:
+                _square_embedded_cover(ap)
+            return ap
 
     tail_txt = "\n".join(tail_lines)
     final_path = _extract_final_path_from_tail(tail_txt, out_dir)
     if final_path and os.path.exists(final_path):
-        return os.path.abspath(final_path)
+        ap = os.path.abspath(final_path)
+        if extract_mp3:
+            _square_embedded_cover(ap)
+        return ap
 
     if rc != 0:
         raise RuntimeError(f"yt-dlp failed (format: {fmt})\n{_tail(tail_txt)}")
@@ -665,6 +755,7 @@ def download_playlist(
     extension: Optional[str] = None,
     out_dir: str = DEFAULT_OUT_DIR,
     on_line: Callable[[str], None],
+    write_metadata: bool = False,
 ) -> str:
     """
     Download every track in a playlist.
@@ -722,7 +813,7 @@ def download_playlist(
             files = _download_with_format_stream(
                 url=url, out_dir=out_dir, fmt="bestaudio/best",
                 merge_output_format=None, extract_mp3=True,
-                on_line=on_line, playlist=True,
+                on_line=on_line, playlist=True, write_metadata=write_metadata,
                 abort_event=abort_event, archive_path=archive_path,
             )
         elif mode == "best":
@@ -730,7 +821,7 @@ def download_playlist(
                 files = _download_with_format_stream(
                     url=url, out_dir=out_dir, fmt=_fmt_best(cap),
                     merge_output_format=None, extract_mp3=False,
-                    on_line=on_line, playlist=True,
+                    on_line=on_line, playlist=True, write_metadata=write_metadata,
                     abort_event=abort_event, archive_path=archive_path,
                 )
             except Exception:
@@ -738,14 +829,14 @@ def download_playlist(
                     files = _download_with_format_stream(
                         url=url, out_dir=out_dir, fmt=_fmt_mp4_apple_safe(cap),
                         merge_output_format="mp4", extract_mp3=False,
-                        on_line=on_line, playlist=True,
+                        on_line=on_line, playlist=True, write_metadata=write_metadata,
                         abort_event=abort_event, archive_path=archive_path,
                     )
                 except Exception:
                     files = _download_with_format_stream(
                         url=url, out_dir=out_dir, fmt="bestvideo+bestaudio/best",
                         merge_output_format="mp4", extract_mp3=False,
-                        on_line=on_line, playlist=True,
+                        on_line=on_line, playlist=True, write_metadata=write_metadata,
                         abort_event=abort_event, archive_path=archive_path,
                     )
         else:  # mp4
@@ -753,14 +844,14 @@ def download_playlist(
                 files = _download_with_format_stream(
                     url=url, out_dir=out_dir, fmt=_fmt_mp4_apple_safe(cap),
                     merge_output_format="mp4", extract_mp3=False,
-                    on_line=on_line, playlist=True,
+                    on_line=on_line, playlist=True, write_metadata=write_metadata,
                     abort_event=abort_event, archive_path=archive_path,
                 )
             except Exception:
                 files = _download_with_format_stream(
                     url=url, out_dir=out_dir, fmt="bestvideo+bestaudio/best",
                     merge_output_format="mp4", extract_mp3=False,
-                    on_line=on_line, playlist=True,
+                    on_line=on_line, playlist=True, write_metadata=write_metadata,
                     abort_event=abort_event, archive_path=archive_path,
                 )
 
@@ -804,7 +895,7 @@ def download_playlist(
                     files = _download_with_format_stream(
                         url=url, out_dir=out_dir, fmt="bestaudio/best",
                         merge_output_format=None, extract_mp3=True,
-                        on_line=on_line, playlist=True,
+                        on_line=on_line, playlist=True, write_metadata=write_metadata,
                         abort_event=fill_abort, archive_path=archive_path,
                     )
                 elif mode == "best":
@@ -812,7 +903,7 @@ def download_playlist(
                         files = _download_with_format_stream(
                             url=url, out_dir=out_dir, fmt=_fmt_best(cap),
                             merge_output_format=None, extract_mp3=False,
-                            on_line=on_line, playlist=True,
+                            on_line=on_line, playlist=True, write_metadata=write_metadata,
                             abort_event=fill_abort, archive_path=archive_path,
                         )
                     except Exception:
@@ -820,14 +911,14 @@ def download_playlist(
                             files = _download_with_format_stream(
                                 url=url, out_dir=out_dir, fmt=_fmt_mp4_apple_safe(cap),
                                 merge_output_format="mp4", extract_mp3=False,
-                                on_line=on_line, playlist=True,
+                                on_line=on_line, playlist=True, write_metadata=write_metadata,
                                 abort_event=fill_abort, archive_path=archive_path,
                             )
                         except Exception:
                             files = _download_with_format_stream(
                                 url=url, out_dir=out_dir, fmt="bestvideo+bestaudio/best",
                                 merge_output_format="mp4", extract_mp3=False,
-                                on_line=on_line, playlist=True,
+                                on_line=on_line, playlist=True, write_metadata=write_metadata,
                                 abort_event=fill_abort, archive_path=archive_path,
                             )
                 else:
@@ -835,14 +926,14 @@ def download_playlist(
                         files = _download_with_format_stream(
                             url=url, out_dir=out_dir, fmt=_fmt_mp4_apple_safe(cap),
                             merge_output_format="mp4", extract_mp3=False,
-                            on_line=on_line, playlist=True,
+                            on_line=on_line, playlist=True, write_metadata=write_metadata,
                             abort_event=fill_abort, archive_path=archive_path,
                         )
                     except Exception:
                         files = _download_with_format_stream(
                             url=url, out_dir=out_dir, fmt="bestvideo+bestaudio/best",
                             merge_output_format="mp4", extract_mp3=False,
-                            on_line=on_line, playlist=True,
+                            on_line=on_line, playlist=True, write_metadata=write_metadata,
                             abort_event=fill_abort, archive_path=archive_path,
                         )
             except RuntimeError:
@@ -885,6 +976,7 @@ def download_multi_url(
     extension: Optional[str] = None,
     out_dir: str = DEFAULT_OUT_DIR,
     on_line: Callable[[str], None],
+    write_metadata: bool = False,
 ) -> str:
     """
     Download a comma-separated list of URLs into a single ZIP (multi_url.zip).
@@ -929,6 +1021,7 @@ def download_multi_url(
             merge_output_format=merge_fmt, extract_mp3=mp3,
             on_line=_on_line_intercepted, playlist=is_pl,
             abort_event=ab, archive_path=archive,
+            write_metadata=write_metadata,
         )
         return [result] if isinstance(result, str) else result
 
@@ -1021,6 +1114,7 @@ def download_video(
     extension: Optional[str] = None,
     out_dir: str = DEFAULT_OUT_DIR,
     on_line: Callable[[str], None],
+    write_metadata: bool = False,
 ) -> str:
     """
     Download a single video/audio URL, or a full playlist.
@@ -1035,14 +1129,14 @@ def download_video(
         if len(urls) > 1:
             return download_multi_url(
                 urls=urls, resolution=resolution, extension=extension,
-                out_dir=out_dir, on_line=on_line,
+                out_dir=out_dir, on_line=on_line, write_metadata=write_metadata,
             )
         url = urls[0]  # single URL with stray trailing comma
 
     if is_playlist_url(url):
         return download_playlist(
             url=url, resolution=resolution, extension=extension,
-            out_dir=out_dir, on_line=on_line,
+            out_dir=out_dir, on_line=on_line, write_metadata=write_metadata,
         )
 
     out_dir = os.path.abspath(out_dir)
@@ -1058,33 +1152,39 @@ def download_video(
             return _download_with_format_stream(
                 url=url, out_dir=out_dir, fmt="bestaudio/best",
                 merge_output_format=None, extract_mp3=True, on_line=on_line,
+                write_metadata=write_metadata,
             )
         if mode == "best":
             try:
                 return _download_with_format_stream(
                     url=url, out_dir=out_dir, fmt=_fmt_best(cap),
                     merge_output_format=None, extract_mp3=False, on_line=on_line,
+                    write_metadata=write_metadata,
                 )
             except Exception:
                 try:
                     return _download_with_format_stream(
                         url=url, out_dir=out_dir, fmt=_fmt_mp4_apple_safe(cap),
                         merge_output_format="mp4", extract_mp3=False, on_line=on_line,
+                        write_metadata=write_metadata,
                     )
                 except Exception:
                     return _download_with_format_stream(
                         url=url, out_dir=out_dir, fmt="bestvideo+bestaudio/best",
                         merge_output_format="mp4", extract_mp3=False, on_line=on_line,
+                        write_metadata=write_metadata,
                     )
         try:
             return _download_with_format_stream(
                 url=url, out_dir=out_dir, fmt=_fmt_mp4_apple_safe(cap),
                 merge_output_format="mp4", extract_mp3=False, on_line=on_line,
+                write_metadata=write_metadata,
             )
         except Exception:
             return _download_with_format_stream(
                 url=url, out_dir=out_dir, fmt="bestvideo+bestaudio/best",
                 merge_output_format="mp4", extract_mp3=False, on_line=on_line,
+                write_metadata=write_metadata,
             )
     finally:
         pass  # VPN stays connected — never disconnect mid-service
