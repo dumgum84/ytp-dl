@@ -14,13 +14,14 @@ Privacy-focused media downloader API for Linux VPS deployments — powered by yt
 - Privacy-first: connect/disconnect Mullvad per download
 - Smart quality selection: prefers 1080p H.264 + AAC (no transcoding)
 - Best format mode: let yt-dlp pick the highest quality available (adaptive, no transcoding)
-- Audio extraction: downloads best audio stream as MP3 with embedded cover art and metadata (re-encodes only when the source isn't already MP3)
+- Audio extraction: best audio stream as MP3 with embedded cover art and metadata (re-encodes only when the source isn't already MP3)
 - Playlist support: YouTube playlists, SoundCloud sets, Bilibili series, Odysee playlists — downloads all tracks and produces a ZIP of the individual files
+- Optional per-file metadata: emits title/artist and writes a thumbnail for OS lock-screen / Media Session controls (opt-in via the `metadata` field)
 - Streaming HTTP API:
   - `POST /api/download` streams real-time yt-dlp output as Server-Sent Events (SSE)
   - `GET  /api/fetch/<job_id>` fetches the finished file
   - `GET  /api/fetch/<job_id>/<filename>` fetches a specific file from a job by name
-- Optional R2 upload: upload completed files to Cloudflare R2 and emit `data: [r2] key=<object_key>` — playlist/multi jobs also upload every individual track, announced via `data: [r2_track] key=<object_key>`
+- Optional R2 upload: push completed files to Cloudflare R2; playlist/multi jobs upload each track individually so clients can stream them without unpacking the ZIP
 - Stable public API under VPN cycling: exclude the API port from the tunnel (nftables marks) + policy routing
 - VPS-ready: automated installer script for Ubuntu
 
@@ -29,7 +30,7 @@ Privacy-focused media downloader API for Linux VPS deployments — powered by yt
 ## Installation
 
 ```bash
-pip install ytp-dl==2026.6.12
+pip install ytp-dl==2026.6.18
 ```
 
 ### Requirements
@@ -158,6 +159,7 @@ python3 ytp-dl.py --url "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 | `--url` | *(required)* | Media URL to download |
 | `--extension` | `mp4` | `mp4`, `mp3`, or `best` |
 | `--resolution` | `1080` | Max height cap (ignored for `mp3`) |
+| `--metadata` | *(off)* | Request per-file title/artist + thumbnail for OS media controls |
 | `--out-dir` | `.` | Directory to save the file |
 | `--max-retries` | `5` | Retries on server-side error, e.g. rate-limit |
 | `--retry-delay` | `1` | Seconds before first retry; doubles each attempt (max 60s) |
@@ -219,6 +221,8 @@ _SUPPRESS_PREFIXES = (
     "[playlist_title] ",
     "[r2_track] ",
     "[r2_tracks_incomplete]",
+    "[meta] ",
+    "[meta_thumb] ",
     "[ready] ",
     "[file] ",
 )
@@ -231,6 +235,7 @@ class Config:
     extension: str
     resolution: Optional[int]
     job_id: str
+    metadata: bool
     out_dir: str
     connect_timeout_s: float
     read_timeout_s: float
@@ -305,6 +310,8 @@ def stream_logs_and_get_fetch_path(
     payload: dict = {"url": cfg.url, "extension": cfg.extension, "job_id": cfg.job_id}
     if cfg.resolution is not None:
         payload["resolution"] = int(cfg.resolution)
+    if cfg.metadata:
+        payload["metadata"] = True
 
     headers = {"Accept": "text/event-stream", "Content-Type": "application/json"}
 
@@ -406,6 +413,8 @@ def parse_args(argv: list[str]) -> Config:
                    help="Download mode")
     p.add_argument("--resolution", type=int, default=1080,
                    help="Max height cap (default: 1080)")
+    p.add_argument("--metadata", action="store_true",
+                   help="Request lock-screen metadata (sidecar thumbnail + title/artist)")
     p.add_argument("--out-dir", default=".", help="Directory to save the fetched file")
     p.add_argument("--connect-timeout", type=float, default=15.0)
     p.add_argument("--read-timeout", type=float, default=300.0)
@@ -424,6 +433,7 @@ def parse_args(argv: list[str]) -> Config:
         extension=a.extension,
         resolution=a.resolution if a.extension != "mp3" else None,
         job_id=_auto_job_id(),
+        metadata=a.metadata,
         out_dir=a.out_dir,
         connect_timeout_s=a.connect_timeout,
         read_timeout_s=a.read_timeout,
@@ -561,13 +571,15 @@ Request body:
   "url": "string (required)",
   "resolution": "integer (optional, default: 1080)",
   "extension": "string (optional: 'mp4', 'mp3', or 'best')",
-  "job_id": "string (optional, recommended for fetch; [A-Za-z0-9_-])"
+  "job_id": "string (optional, recommended for fetch; [A-Za-z0-9_-])",
+  "metadata": "boolean (optional, default: false)"
 }
 ```
 
 - `mp4` — 1080p H.264 + AAC, no transcoding
 - `mp3` — best audio stream, output as MP3 with embedded cover art and metadata
 - `best` — yt-dlp selects the highest quality adaptive format; `resolution` is ignored
+- `metadata` — when `true`, emits per-file `[meta]` (title/artist) and `[meta_thumb]` (artwork) events for OS lock-screen / Media Session controls. Defaults to `false`.
 
 Response — `200 OK` SSE stream (`text/event-stream`):
 
@@ -575,8 +587,11 @@ Response — `200 OK` SSE stream (`text/event-stream`):
 data: [start] job_id=<job_id>
 data: [total_items] <n>               # playlist/multi only — track count
 data: <yt-dlp output lines>
+data: [meta] media=<filename>\ttitle=<title>\tartist=<artist>   # metadata=true only — per file
 data: [r2_upload] XX.XX%              # R2 only — per track, then the result file
 data: [r2_track] key=<object_key>     # R2 + playlist/multi only — one per uploaded track
+data: [meta_thumb] media=<filename>\tkey=<object_key>    # metadata=true + R2 — artwork in R2
+data: [meta_thumb] media=<filename>\tfile=<thumb_filename> # metadata=true, no R2 — fetch via /api/fetch
 data: [r2_tracks_incomplete]          # R2 + playlist/multi only — a track upload failed
 data: [ready] job_id=<job_id>
 data: [file] <filename>               # the media file — or the ZIP name for playlists
@@ -584,6 +599,8 @@ data: [r2] key=<object_key>           # R2 only — the result file's key
 data: [fetch] /api/fetch/<job_id>
 data: [done]
 ```
+
+> `[meta]` / `[meta_thumb]` appear only when `metadata: true`; fields are tab-separated. `[meta_thumb]` carries an R2 `key=` with R2 enabled, or a `file=` filename otherwise (fetched from `/api/fetch/<job_id>/<thumb_filename>`).
 
 Other responses:
 - `400 Bad Request` — missing or invalid URL/params
@@ -819,7 +836,7 @@ python3 -m venv "${VENV_DIR}"
 source "${VENV_DIR}/bin/activate"
 pip install --upgrade pip
 
-pip install "ytp-dl==2026.6.12"
+pip install "ytp-dl==2026.6.18"
 if [[ "${YTPDL_R2_UPLOAD}" == "1" ]]; then
   pip install boto3
 fi
