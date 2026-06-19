@@ -419,6 +419,13 @@ def _build_ytdlp_argv(
         *(_common_flags(playlist=playlist)),
         "--output", out_tpl,
         "--print", "after_move:filepath",
+        # Emit the resolved format_id before downloading so the frontend can size
+        # its progress slots: "137+140" = a DASH video+audio merge (two download
+        # phases), a bare id like "18" = one combined stream. --print output
+        # prints even though --print implies --quiet — which is why this works
+        # where yt-dlp's own "Downloading N format(s)" line (quiet-suppressed) does
+        # not.
+        "--print", "before_dl:[dl_streams] %(format_id)s",
         "--progress",
         "--newline",
         "--no-color",
