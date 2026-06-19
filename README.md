@@ -14,9 +14,10 @@ Privacy-focused media downloader API for Linux VPS deployments — powered by yt
 - Privacy-first: connect/disconnect Mullvad per download
 - Smart quality selection: prefers 1080p H.264 + AAC (no transcoding)
 - Best format mode: let yt-dlp pick the highest quality available (adaptive, no transcoding)
-- Audio extraction: best audio stream as MP3 with embedded cover art and metadata (re-encodes only when the source isn't already MP3)
+- Audio extraction: best audio stream as MP3 with cover art and title/artist/date tags embedded in the file (re-encodes only when the source isn't already MP3)
 - Playlist support: YouTube playlists, SoundCloud sets, Bilibili series, Odysee playlists — downloads all tracks and produces a ZIP of the individual files
-- Optional per-file metadata: emits title/artist and writes a thumbnail for OS lock-screen / Media Session controls (opt-in via the `metadata` field)
+- Multi-URL support: pass several comma-separated URLs (single videos and/or playlists) in one request — each downloads into its own subdirectory to avoid filename collisions, and the whole set is returned as a single ZIP
+- Optional real-time track info: with the `metadata` field on, the job emits per-file title/artist and a thumbnail *to the client* as it runs — `[meta]` / `[meta_thumb]` SSE events plus a sidecar image — to drive Media Session controls (opt-in, off by default)
 - Streaming HTTP API:
   - `POST /api/download` streams real-time yt-dlp output as Server-Sent Events (SSE)
   - `GET  /api/fetch/<job_id>` fetches the finished file
@@ -30,7 +31,7 @@ Privacy-focused media downloader API for Linux VPS deployments — powered by yt
 ## Installation
 
 ```bash
-pip install ytp-dl==2026.6.18
+pip install ytp-dl==2026.6.19
 ```
 
 ### Requirements
@@ -159,7 +160,7 @@ python3 ytp-dl.py --url "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 | `--url` | *(required)* | Media URL to download |
 | `--extension` | `mp4` | `mp4`, `mp3`, or `best` |
 | `--resolution` | `1080` | Max height cap (ignored for `mp3`) |
-| `--metadata` | *(off)* | Request per-file title/artist + thumbnail for OS media controls |
+| `--metadata` | *(off)* | Emit per-file title/artist + thumbnail to the client (Media Session controls) |
 | `--out-dir` | `.` | Directory to save the file |
 | `--max-retries` | `5` | Retries on server-side error, e.g. rate-limit |
 | `--retry-delay` | `1` | Seconds before first retry; doubles each attempt (max 60s) |
@@ -414,7 +415,7 @@ def parse_args(argv: list[str]) -> Config:
     p.add_argument("--resolution", type=int, default=1080,
                    help="Max height cap (default: 1080)")
     p.add_argument("--metadata", action="store_true",
-                   help="Request lock-screen metadata (sidecar thumbnail + title/artist)")
+                   help="Emit per-file track info to the client (sidecar thumbnail + title/artist)")
     p.add_argument("--out-dir", default=".", help="Directory to save the fetched file")
     p.add_argument("--connect-timeout", type=float, default=15.0)
     p.add_argument("--read-timeout", type=float, default=300.0)
@@ -577,9 +578,9 @@ Request body:
 ```
 
 - `mp4` — 1080p H.264 + AAC, no transcoding
-- `mp3` — best audio stream, output as MP3 with embedded cover art and metadata
+- `mp3` — best audio stream, output as MP3 with cover art and title/artist tags embedded in the file
 - `best` — yt-dlp selects the highest quality adaptive format; `resolution` is ignored
-- `metadata` — when `true`, emits per-file `[meta]` (title/artist) and `[meta_thumb]` (artwork) events for OS lock-screen / Media Session controls. Defaults to `false`.
+- `metadata` — when `true`, the job emits per-file `[meta]` (title/artist) and `[meta_thumb]` (artwork) events to the client as it runs, plus a sidecar thumbnail, to drive Media Session controls. Defaults to `false`.
 
 Response — `200 OK` SSE stream (`text/event-stream`):
 
@@ -599,8 +600,6 @@ data: [r2] key=<object_key>           # R2 only — the result file's key
 data: [fetch] /api/fetch/<job_id>
 data: [done]
 ```
-
-> `[meta]` / `[meta_thumb]` appear only when `metadata: true`; fields are tab-separated. `[meta_thumb]` carries an R2 `key=` with R2 enabled, or a `file=` filename otherwise (fetched from `/api/fetch/<job_id>/<thumb_filename>`).
 
 Other responses:
 - `400 Bad Request` — missing or invalid URL/params
@@ -836,7 +835,7 @@ python3 -m venv "${VENV_DIR}"
 source "${VENV_DIR}/bin/activate"
 pip install --upgrade pip
 
-pip install "ytp-dl==2026.6.18"
+pip install "ytp-dl==2026.6.19"
 if [[ "${YTPDL_R2_UPLOAD}" == "1" ]]; then
   pip install boto3
 fi
