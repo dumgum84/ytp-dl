@@ -31,7 +31,7 @@ Privacy-focused media downloader API for Linux VPS deployments — powered by yt
 ## Installation
 
 ```bash
-pip install ytp-dl==2026.6.19
+pip install ytp-dl==2026.6.19.1
 ```
 
 ### Requirements
@@ -835,7 +835,7 @@ python3 -m venv "${VENV_DIR}"
 source "${VENV_DIR}/bin/activate"
 pip install --upgrade pip
 
-pip install "ytp-dl==2026.6.19"
+pip install "ytp-dl==2026.6.19.1"
 if [[ "${YTPDL_R2_UPLOAD}" == "1" ]]; then
   pip install boto3
 fi
