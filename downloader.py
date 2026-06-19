@@ -474,6 +474,14 @@ def _build_ytdlp_argv(
         if merge_output_format:
             argv.extend(["--merge-output-format", merge_output_format])
 
+    # Sites with no dedicated extractor fall back to yt-dlp's [generic]
+    # extractor. When such a site sits behind Cloudflare, the default TLS
+    # fingerprint earns a 403 anti-bot challenge; impersonation via curl_cffi
+    # clears it. Scoped to the generic extractor, so sites with their own
+    # extractor (YouTube, etc.) are unaffected — this is a no-op for them.
+    if _CURL_CFFI_AVAILABLE:
+        argv.extend(["--extractor-args", "generic:impersonate"])
+
     # PornHub blocks non-browser TLS fingerprints (HTTP 410/403 errors).
     # Requires curl_cffi: included via yt-dlp[default,curl-cffi] in requirements.txt
     if _PH_URL_RE.search(url) and _CURL_CFFI_AVAILABLE:
