@@ -244,12 +244,19 @@ def _common_flags(*, playlist: bool = False) -> List[str]:
         "--extractor-retries", "10",
         "--retry-sleep", "exp=1:30",
         "--user-agent", MODERN_UA,
-        "--no-cache-dir",
         "--ignore-config",
         "--embed-metadata",
-        "--sleep-interval", "1",
     ]
     flags.append("--yes-playlist" if playlist else "--no-playlist")
+    # --sleep-interval spaces out sequential requests to dodge rate limits; that
+    # only matters when a run makes many requests (a playlist). For a single
+    # video it's just a flat 1s of dead time before the download starts, so it's
+    # scoped to the playlist path. --no-cache-dir was removed entirely: caching
+    # lets yt-dlp reuse YouTube's extracted nsig/player function across requests
+    # (keyed by player version, not IP — safe across VPN rotation) instead of
+    # re-deriving it every time, which is the slow part of extraction.
+    if playlist:
+        flags.extend(["--sleep-interval", "1"])
     return flags
 
 
