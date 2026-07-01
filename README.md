@@ -31,7 +31,7 @@ Privacy-focused media downloader API for Linux VPS deployments — powered by yt
 ## Installation
 
 ```bash
-pip install ytp-dl==2026.6.19.1
+pip install ytp-dl==2026.6.30
 ```
 
 ### Requirements
@@ -162,6 +162,7 @@ python3 ytp-dl.py --url "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 | `--resolution` | `1080` | Max height cap (ignored for `mp3`) |
 | `--metadata` | *(off)* | Emit per-file title/artist + thumbnail to the client (Media Session controls) |
 | `--out-dir` | `.` | Directory to save the file |
+| `--token` | `$YTPDL_VPS_API_TOKEN` or *(empty)* | Sent as the `X-YTPDL-Token` header; only needed if the server sets `YTPDL_VPS_API_TOKEN` |
 | `--max-retries` | `5` | Retries on server-side error, e.g. rate-limit |
 | `--retry-delay` | `1` | Seconds before first retry; doubles each attempt (max 60s) |
 | `--retry-factor` | `2` | Backoff multiplier applied after each retry |
@@ -237,6 +238,7 @@ class Config:
     resolution: Optional[int]
     job_id: str
     metadata: bool
+    token: str
     out_dir: str
     connect_timeout_s: float
     read_timeout_s: float
@@ -315,6 +317,8 @@ def stream_logs_and_get_fetch_path(
         payload["metadata"] = True
 
     headers = {"Accept": "text/event-stream", "Content-Type": "application/json"}
+    if cfg.token:
+        headers["X-YTPDL-Token"] = cfg.token
 
     fetch_path: Optional[str] = None
     resolved_job_id: str = cfg.job_id
@@ -375,11 +379,15 @@ def stream_logs_and_get_fetch_path(
 def fetch_file(cfg: Config, fetch_path: str) -> str:
     os.makedirs(cfg.out_dir, exist_ok=True)
 
+    headers = {"Connection": "close"}
+    if cfg.token:
+        headers["X-YTPDL-Token"] = cfg.token
+
     with requests.get(
         f"{cfg.base}{fetch_path}",
         stream=True,
         timeout=(cfg.connect_timeout_s, cfg.read_timeout_s),
-        headers={"Connection": "close"},
+        headers=headers,
     ) as r:
         r.raise_for_status()
 
@@ -417,6 +425,12 @@ def parse_args(argv: list[str]) -> Config:
     p.add_argument("--metadata", action="store_true",
                    help="Emit per-file track info to the client (sidecar thumbnail + title/artist)")
     p.add_argument("--out-dir", default=".", help="Directory to save the fetched file")
+    p.add_argument(
+        "--token",
+        default=os.environ.get("YTPDL_VPS_API_TOKEN", ""),
+        help="Shared secret sent as the X-YTPDL-Token header (env: YTPDL_VPS_API_TOKEN). "
+             "Only required if the server has YTPDL_VPS_API_TOKEN set; leave empty otherwise.",
+    )
     p.add_argument("--connect-timeout", type=float, default=15.0)
     p.add_argument("--read-timeout", type=float, default=300.0)
     p.add_argument("--max-retries", type=int, default=5,
@@ -435,6 +449,7 @@ def parse_args(argv: list[str]) -> Config:
         resolution=a.resolution if a.extension != "mp3" else None,
         job_id=_auto_job_id(),
         metadata=a.metadata,
+        token=a.token,
         out_dir=a.out_dir,
         connect_timeout_s=a.connect_timeout,
         read_timeout_s=a.read_timeout,
@@ -496,7 +511,6 @@ def main(argv: list[str]) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
-
 ```
 
 ---
@@ -835,7 +849,7 @@ python3 -m venv "${VENV_DIR}"
 source "${VENV_DIR}/bin/activate"
 pip install --upgrade pip
 
-pip install "ytp-dl==2026.6.19.1"
+pip install "ytp-dl==2026.6.30"
 if [[ "${YTPDL_R2_UPLOAD}" == "1" ]]; then
   pip install boto3
 fi
