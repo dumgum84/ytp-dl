@@ -5,71 +5,36 @@
 [![License](https://img.shields.io/pypi/l/ytp-dl.svg)](https://pypi.org/project/ytp-dl/)
 [![Downloads](https://img.shields.io/pypi/dm/ytp-dl.svg)](https://pypi.org/project/ytp-dl/)
 
-Privacy-focused media downloader API for Linux VPS deployments — powered by yt-dlp, routed through Mullvad VPN, with real-time SSE log streaming.
-
----
+Privacy-focused yt-dlp API with Mullvad routing.
 
 ## Features
 
-- Privacy-first: connect/disconnect Mullvad per download
-- Smart quality selection: prefers 1080p H.264 + AAC (no transcoding)
-- Best format mode: let yt-dlp pick the highest quality available (adaptive, no transcoding)
-- Audio extraction: best audio stream as MP3 with cover art and title/artist/date tags embedded in the file (re-encodes only when the source isn't already MP3)
-- Playlist support: YouTube playlists, SoundCloud sets, Bilibili series, Odysee playlists — downloads all tracks and produces a ZIP of the individual files
-- Multi-URL support: pass several comma-separated URLs (single videos and/or playlists) in one request — each downloads into its own subdirectory to avoid filename collisions, and the whole set is returned as a single ZIP
-- Optional real-time track info: with the `metadata` field on, the job emits per-file title/artist and a thumbnail *to the client* as it runs — `[meta]` / `[meta_thumb]` SSE events plus a sidecar image — to drive Media Session controls (opt-in, off by default)
-- Streaming HTTP API:
-  - `POST /api/download` streams real-time yt-dlp output as Server-Sent Events (SSE)
-  - `GET  /api/fetch/<job_id>` fetches the finished file
-  - `GET  /api/fetch/<job_id>/<filename>` fetches a specific file from a job by name
-- Optional R2 upload: push completed files to Cloudflare R2; playlist/multi jobs upload each track individually so clients can stream them without unpacking the ZIP
-- Stable public API under VPN cycling: exclude the API port from the tunnel (nftables marks) + policy routing
-- VPS-ready: automated installer script for Ubuntu
-
----
+- MP4, MP3, and best-format downloads
+- Playlist and multi-URL support
+- Server-Sent Events (SSE) for live download output
+- Optional title, artist, and artwork metadata
+- Optional Cloudflare R2 storage
+- Durable job status for reconnect/recovery
+- Configurable concurrency, timeouts, and disk reserve
+- Isolated Mullvad routing for yt-dlp while SSH/API traffic stays on the normal VPS network
 
 ## Installation
 
 ```bash
-pip install ytp-dl==2026.6.30
+pip install ytp-dl==2026.9.22
 ```
 
 ### Requirements
 
-- Linux (tested on Ubuntu 24.04/25.04)
-- Mullvad CLI installed and configured
-- FFmpeg (audio/video handling)
-- Deno (system-wide; required by yt-dlp for modern YouTube extraction)
-- Python 3.8+
-
-Notes:
-- yt-dlp expects **Deno** to be available on `PATH` to run its JavaScript-based extraction logic.
-
----
+- Linux (Ubuntu 24.04 LTS recommended)
+- Python 3.10+
+- FFmpeg
+- Deno
+- A Mullvad account for the included VPN setup
 
 ## Quick start
 
-A download is a **two-phase** flow:
-
-1) Start the job and stream logs:
-- `POST /api/download` (SSE)
-
-2) Fetch the finished file:
-- `GET /api/fetch/<job_id>`
-
-### Start a best-quality download
-
-```bash
-curl -N --http1.1 \
-  -H "Accept: text/event-stream" \
-  -H "Content-Type: application/json" \
-  -X POST "http://YOUR_VPS_IP:5000/api/download" \
-  --data-binary '{"url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ","extension":"best","job_id":"demo3"}'
-```
-
-### Start a video download (1080p MP4)
-
-Choose a `job_id` you can reuse for the follow-up fetch (only letters, numbers, `-`, `_`).
+Start a download:
 
 ```bash
 curl -N --http1.1 \
@@ -79,109 +44,682 @@ curl -N --http1.1 \
   --data-binary '{"url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ","extension":"mp4","resolution":1080,"job_id":"demo1"}'
 ```
 
-### Start an audio download (MP3)
+When the stream reports:
 
-```bash
-curl -N --http1.1 \
-  -H "Accept: text/event-stream" \
-  -H "Content-Type: application/json" \
-  -X POST "http://YOUR_VPS_IP:5000/api/download" \
-  --data-binary '{"url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ","extension":"mp3","job_id":"demo2"}'
-```
-
-
-### Fetch the finished file
-
-When the SSE stream emits a line like:
-
-```
+```text
 data: [fetch] /api/fetch/demo1
 ```
 
-Fetch the file using the same `job_id`:
+fetch the result:
 
 ```bash
 curl -L -O -J "http://YOUR_VPS_IP:5000/api/fetch/demo1"
 ```
 
-- `-O -J` tells curl to use the filename from `Content-Disposition`.
+If `YTPDL_VPS_API_TOKEN` is configured, add:
 
-### Windows (CMD.exe) examples
-
-Start the SSE stream:
-
-```bat
-curl -N --http1.1 ^
-  -H "Accept: text/event-stream" ^
-  -H "Content-Type: application/json" ^
-  -X POST "http://YOUR_VPS_IP:5000/api/download" ^
-  --data-binary "{\"url\":\"https://www.youtube.com/watch?v=dQw4w9WgXcQ\",\"extension\":\"mp4\",\"resolution\":1080,\"job_id\":\"demo1\"}"
+```bash
+-H "X-YTPDL-Token: YOUR_TOKEN"
 ```
 
-Note: PowerShell handles JSON escaping differently — wrap the `--data-binary` value in single quotes and use standard double quotes inside.
+to API requests.
 
-Fetch the finished file:
+### Download modes
 
-```bat
-curl -L -O -J "http://YOUR_VPS_IP:5000/api/fetch/demo1"
+| Mode | Behavior |
+|---|---|
+| `mp4` | Prefers H.264 video + AAC audio at or below `resolution`; falls back to other available formats if needed |
+| `mp3` | Downloads the best audio stream and outputs MP3 |
+| `best` | Prefers the best video + audio combination at or below `resolution`, with broader fallbacks |
+
+`resolution` defaults to `1080` and is ignored for MP3 downloads.
+
+## API
+
+### `POST /api/download`
+
+Starts a download and returns a Server-Sent Events (SSE) stream. The HTTP connection remains open while the job runs and closes after the terminal `[done]` event.
+
+```json
+{
+  "url": "https://example.com/media",
+  "extension": "mp4",
+  "resolution": 1080,
+  "job_id": "example-job",
+  "metadata": false
+}
 ```
 
----
+`url` is required. `extension` may be `mp4`, `mp3`, or `best`. `resolution` defaults to `1080` and is ignored for MP3 downloads. `job_id` is optional but recommended when the caller needs to reconnect or fetch the completed result. Set `metadata` to `true` to emit media metadata and artwork events.
 
-## Python client
+#### Streaming response (SSE)
 
-A minimal Python script that replicates the two-phase download flow (SSE stream → fetch) and handles server-side errors with retries and playlist resume.
+The response uses `Content-Type: text/event-stream`. Each message is sent as an SSE `data:` field followed by a blank line, so clients can consume download output as it happens instead of polling for progress.
+
+The quick-start `curl` command uses `-N` (`--no-buffer`) so events are printed to the terminal immediately as they arrive.
+
+A stream can contain three kinds of output:
+
+- **yt-dlp output** — human-readable extractor, download, speed, ETA, retry, and post-processing messages. These are useful for logs and user interfaces, but their wording is controlled by yt-dlp and may change between yt-dlp versions.
+- **ytp-dl protocol events** — documented events intended for programmatic job state, progress, metadata, and result handling.
+- **diagnostic/internal lines** — implementation details that may appear in the stream. Clients should ignore unrecognized lines rather than depending on them.
+
+Applications should use the documented ytp-dl protocol events for machine-readable behavior instead of parsing arbitrary yt-dlp text.
+
+| Event | Meaning |
+|---|---|
+| `[start] job_id=<id>` | The job has started. |
+| `[total_items] <n>` | Total item count for a playlist or multi-URL job. |
+| `[finalize] <percent>` | Real FFmpeg finalization progress when an applicable conversion, merge, or remux stage runs. This event may be absent when no measurable FFmpeg finalization is required. |
+| `[r2_upload] <percent>` | Progress for the current R2 upload. Collection jobs may emit this for individual tracks and the final result ZIP. |
+| `[r2_track] key=<key>` | An individual collection item has been uploaded to R2. |
+| `[meta] media=<name>\ttitle=<title>\tartist=<artist>` | Per-file media metadata when metadata output is enabled. |
+| `[meta_thumb] ...` | Artwork location for a media file when metadata output is enabled. |
+| `[ready] job_id=<id>` | Processing has completed and the result is ready to retrieve. |
+| `[file] <filename>` | Final result filename. For collections, this is the result ZIP. |
+| `[r2] key=<key>` | R2 key for the final result when R2 delivery is enabled. |
+| `[fetch] /api/fetch/<id>` | Endpoint for retrieving the completed result. |
+| `[error] <message>` | The job failed. A terminal `[done]` follows. |
+| `[done]` | Terminal event for the SSE stream. No further job output follows. |
+
+### `GET /api/status/<job_id>`
+
+Returns the current durable VPS-side job state: `active`, `complete`, `incomplete`, or `missing`. This endpoint is independent of the original SSE connection and can be used to recover state after a client disconnects.
+
+### `GET /api/fetch/<job_id>`
+
+Returns the finished file or redirects to its R2 object when applicable.
+
+### `GET /api/fetch/<job_id>/<filename>`
+
+Returns an individual collection file for inline streaming.
+
+### `GET /healthz`
+
+Returns service health and current download capacity.
+
+```json
+{
+  "ok": true,
+  "in_use": 0,
+  "capacity": 1
+}
+```
+
+When `YTPDL_VPS_API_TOKEN` is set, the download, status, and fetch routes require the same value in the `X-YTPDL-Token` header. `/healthz` remains unauthenticated.
+
+## Configuration
+
+Default service settings:
+
+| Variable | Default | Description |
+|---|---:|---|
+| `PORT` | `5000` | API port |
+| `YTPDL_MAX_CONCURRENT` | `1` | Maximum simultaneous download jobs across the VPS |
+| `GUNICORN_WORKERS` | `1` | Gunicorn worker processes |
+| `GUNICORN_THREADS` | `2` | Threads per Gunicorn worker |
+| `YTPDL_MEMORY_MAX` | `2G` | systemd memory ceiling for the API service |
+| `YTPDL_MIN_FREE_DISK_MB` | `8192` | Minimum free disk reserve before new jobs are refused |
+| `YTPDL_JOB_TIMEOUT_S` | `1800` | Single-file yt-dlp timeout |
+| `YTPDL_PLAYLIST_JOB_TIMEOUT_S` | `21600` | Playlist yt-dlp timeout |
+| `YTPDL_PLAYLIST_PASSES` | `5` | Maximum passes used to recover missing playlist entries |
+| `YTPDL_R2_ZIP_PART_SIZE_MB` | `16` | Multipart buffer size for collection ZIP uploads |
+| `YTPDL_R2_ZIP_WORKERS` | `10` | Concurrent multipart workers per collection ZIP upload |
+| `YTPDL_R2_UPLOAD` | `0` | Enable R2 uploads |
+| `YTPDL_VPS_API_TOKEN` | *(empty)* | Optional shared API token |
+| `YTPDL_MULLVAD_LOCATION` | `us` | Mullvad relay filter used by the installer |
+
+API runtime settings can be overridden in `/etc/default/ytp-dl-api`. After changing them:
+
+```bash
+sudo systemctl restart ytp-dl-api
+```
+
+R2 requires `R2_ENDPOINT`, `R2_BUCKET`, `R2_ACCESS_KEY_ID`, and `R2_SECRET_ACCESS_KEY`.
+
+## Service management
+
+```bash
+sudo systemctl status ytp-dl-api --no-pager
+sudo journalctl -u ytp-dl-api -f
+sudo systemctl restart ytp-dl-api
+sudo systemctl stop ytp-dl-api
+sudo systemctl start ytp-dl-api
+```
+
+## Deployment notes
+
+- yt-dlp and its child processes use the isolated Mullvad namespace; host services use the VPS's normal network.
+- With R2 enabled, completed files are uploaded to R2; collection ZIPs are streamed to R2 from local media using concurrent multipart uploads. Without R2, results are served from local storage.
+
+## VPS installer
+
+Run as root (`sudo -s`). Enter your Mullvad account number in the `MV_ACCOUNT` variable in the installer before running. R2 and API authentication are optional.
+
+```bash
+#!/usr/bin/env bash
+# VPS_Installation.sh - Ubuntu VPS setup for ytp-dl 2026.9.22
+#
+# Architecture:
+#   - SSH, Gunicorn/API and Cloudflare R2 stay on the VPS's normal network.
+#   - ONLY yt-dlp (and children such as ffmpeg/Deno) run inside a dedicated
+#     Linux network namespace whose sole non-loopback interface is WireGuard.
+#   - The WireGuard interface is created in the host namespace, then moved into
+#     the yt-dlp namespace. Its encrypted UDP socket remains in the host
+#     namespace, while cleartext yt-dlp traffic can only leave through ytpdlwg.
+#   - No global Mullvad route changes, no SSH/API nftables exceptions and no
+#     custom source-policy routing are required.
+#   - VPN rotation is serialized across all Gunicorn workers with flock().
+#   - YTPDL_MAX_CONCURRENT is enforced globally by api.py across all workers.
+#
+# Target: Ubuntu 24.04 LTS.
+
+set -euo pipefail
+
+PORT="${PORT:-5000}"
+APP_DIR="${APP_DIR:-/opt/yt-dlp-mullvad}"
+VENV_DIR="${VENV_DIR:-${APP_DIR}/venv}"
+YTPDL_VERSION="${YTPDL_VERSION:-2026.9.22}"
+
+# Mullvad / isolated WireGuard namespace
+MV_ACCOUNT="${MV_ACCOUNT:-}"
+YTPDL_MULLVAD_LOCATION="${YTPDL_MULLVAD_LOCATION:-us}"
+VPN_NAMESPACE="${VPN_NAMESPACE:-ytpdl-vpn}"
+VPN_DIR="${VPN_DIR:-/etc/ytpdl-vpn}"
+VPN_CONFIG_DIR="${VPN_CONFIG_DIR:-${VPN_DIR}/configs}"
+VPN_HELPER="${VPN_HELPER:-/usr/local/sbin/ytpdl-vpn}"
+VPN_MTU="${VPN_MTU:-1420}"
+VPN_ROTATE_COOLDOWN="${VPN_ROTATE_COOLDOWN:-10}"
+
+# API / Gunicorn
+YTPDL_MAX_CONCURRENT="${YTPDL_MAX_CONCURRENT:-1}"
+YTPDL_MIN_FREE_DISK_MB="${YTPDL_MIN_FREE_DISK_MB:-8192}"
+YTPDL_R2_ZIP_PART_SIZE_MB="${YTPDL_R2_ZIP_PART_SIZE_MB:-16}"
+YTPDL_R2_ZIP_WORKERS="${YTPDL_R2_ZIP_WORKERS:-10}"
+YTPDL_MEMORY_MAX="${YTPDL_MEMORY_MAX:-2G}"
+GUNICORN_WORKERS="${GUNICORN_WORKERS:-1}"
+GUNICORN_THREADS="${GUNICORN_THREADS:-2}"
+YTPDL_VPS_API_TOKEN="${YTPDL_VPS_API_TOKEN:-}"
+
+# R2
+YTPDL_R2_UPLOAD="${YTPDL_R2_UPLOAD:-0}"
+R2_ENDPOINT="${R2_ENDPOINT:-}"
+R2_BUCKET="${R2_BUCKET:-}"
+R2_ACCESS_KEY_ID="${R2_ACCESS_KEY_ID:-}"
+R2_SECRET_ACCESS_KEY="${R2_SECRET_ACCESS_KEY:-}"
+export AWS_EC2_METADATA_DISABLED="true"
+
+[[ "${EUID}" -eq 0 ]] || { echo "Please run as root (sudo -s)" >&2; exit 1; }
+[[ -n "${MV_ACCOUNT}" ]] || { echo "MV_ACCOUNT is required" >&2; exit 1; }
+export DEBIAN_FRONTEND=noninteractive
+
+log() { printf '\n==> %s\n' "$*"; }
+
+log "0) Prepare host networking and stop the API"
+systemctl stop ytp-dl-api.service 2>/dev/null || true
+
+# Ensure the host itself is not routed through the Mullvad app.
+# yt-dlp uses the isolated WireGuard namespace configured below.
+if command -v mullvad >/dev/null 2>&1; then
+    mullvad disconnect >/dev/null 2>&1 || true
+fi
+systemctl disable --now mullvad-daemon.service 2>/dev/null || true
+systemctl disable --now mullvad-early-boot-blocking.service 2>/dev/null || true
+
+# Remove conflicting host-level routing or firewall rules if present.
+systemctl disable --now ytpdl-policy-routing.service 2>/dev/null || true
+systemctl disable --now ytpdl-mullvad-exclude-ports.service 2>/dev/null || true
+rm -f /etc/systemd/system/ytpdl-policy-routing.service
+rm -f /etc/systemd/system/ytpdl-mullvad-exclude-ports.service
+rm -f /usr/local/sbin/ytpdl-policy-routing.sh
+rm -f /usr/local/sbin/ytpdl-mullvad-exclusions.sh
+rm -f /etc/ytpdl-mullvad-exclude-ports.nft
+rm -f /etc/default/ytpdl-policy-routing
+rm -f /etc/sysctl.d/99-ytpdl-policy-routing.conf
+nft delete table inet ytpdl_mullvad_exclusions 2>/dev/null || true
+while ip rule show | grep -qE '^11000:'; do
+    ip rule del priority 11000 2>/dev/null || break
+done
+if grep -qE '^[[:space:]]*100[[:space:]]+ytpdl-public[[:space:]]*$' /etc/iproute2/rt_tables 2>/dev/null; then
+    sed -i '/^[[:space:]]*100[[:space:]]\+ytpdl-public[[:space:]]*$/d' /etc/iproute2/rt_tables
+fi
+systemctl daemon-reload
+
+log "1) Install base packages"
+apt-get update
+apt-get install -yq --no-install-recommends \
+    python3-venv python3-pip python3-cryptography \
+    curl ca-certificates ffmpeg unzip \
+    iproute2 wireguard-tools util-linux
+
+# Verify kernel WireGuard support early.
+modprobe wireguard
+
+log "2) Generate Mullvad WireGuard configurations"
+install -d -m 700 "${VPN_DIR}" "${VPN_CONFIG_DIR}"
+install -d -m 755 /usr/local/lib/ytpdl
+
+# Official Mullvad wg-tools generator. It creates/reuses one WireGuard device key
+# and generates configs for active relays matching YTPDL_MULLVAD_LOCATION.
+curl -fsSLo /usr/local/lib/ytpdl/wg-mullvad.py \
+    https://raw.githubusercontent.com/mullvad/wg-tools/main/wg-mullvad.py
+chmod 755 /usr/local/lib/ytpdl/wg-mullvad.py
+
+# Keep the device key, but refresh relay configs so stale/inactive entries do not
+# accumulate across installer reruns.
+rm -f "${VPN_CONFIG_DIR}"/*.conf 2>/dev/null || true
+python3 /usr/local/lib/ytpdl/wg-mullvad.py \
+    --account "${MV_ACCOUNT}" \
+    --filter "${YTPDL_MULLVAD_LOCATION}" \
+    --active \
+    --settings-file "${VPN_DIR}/device.conf" \
+    --output-dir "${VPN_CONFIG_DIR}"
+chmod 600 "${VPN_DIR}/device.conf" "${VPN_CONFIG_DIR}"/*.conf
+
+if ! find "${VPN_CONFIG_DIR}" -maxdepth 1 -type f -name '*.conf' -print -quit | grep -q .; then
+    echo "No Mullvad WireGuard configs were generated for '${YTPDL_MULLVAD_LOCATION}'." >&2
+    exit 1
+fi
+
+log "3) Install isolated VPN namespace helper"
+cat > /etc/default/ytpdl-vpn <<EOF2
+YTPDL_VPN_NAMESPACE=${VPN_NAMESPACE}
+YTPDL_VPN_CONFIG_DIR=${VPN_CONFIG_DIR}
+YTPDL_VPN_MTU=${VPN_MTU}
+YTPDL_VPN_ROTATE_COOLDOWN=${VPN_ROTATE_COOLDOWN}
+EOF2
+chmod 600 /etc/default/ytpdl-vpn
+
+cat > "${VPN_HELPER}" <<'EOF2'
+#!/usr/bin/env bash
+set -euo pipefail
+
+source /etc/default/ytpdl-vpn
+
+NS="${YTPDL_VPN_NAMESPACE:-ytpdl-vpn}"
+CONFIG_DIR="${YTPDL_VPN_CONFIG_DIR:-/etc/ytpdl-vpn/configs}"
+WG_IF="ytpdlwg"
+MTU="${YTPDL_VPN_MTU:-1420}"
+ROTATE_COOLDOWN="${YTPDL_VPN_ROTATE_COOLDOWN:-10}"
+RUN_DIR="/run/ytpdl-vpn"
+LOCK_FILE="/run/lock/ytpdl-vpn.lock"
+CURRENT_FILE="${RUN_DIR}/current-config"
+LAST_ROTATE_FILE="${RUN_DIR}/last-rotate"
+STRIPPED_FILE="${RUN_DIR}/wireguard-stripped.conf"
+CHECK_URL="https://am.i.mullvad.net/connected"
+IP_URL="https://am.i.mullvad.net/ip"
+
+mkdir -p "${RUN_DIR}" /run/lock
+chmod 700 "${RUN_DIR}"
+
+die() { echo "ytpdl-vpn: $*" >&2; exit 1; }
+
+namespace_exists() {
+    ip netns list | awk '{print $1}' | grep -Fxq "${NS}"
+}
+
+setup_namespace() {
+    if ! namespace_exists; then
+        ip netns add "${NS}"
+    fi
+    ip -n "${NS}" link set lo up
+    mkdir -p "/etc/netns/${NS}"
+    cat > "/etc/netns/${NS}/resolv.conf" <<'DNS'
+nameserver 10.64.0.1
+DNS
+    chmod 644 "/etc/netns/${NS}/resolv.conf"
+}
+
+wg_exists() {
+    namespace_exists && ip -n "${NS}" link show "${WG_IF}" >/dev/null 2>&1
+}
+
+connected() {
+    wg_exists || return 1
+    ip netns exec "${NS}" curl -fsS --connect-timeout 4 --max-time 8 "${CHECK_URL}" 2>/dev/null \
+        | grep -qi 'You are connected to Mullvad'
+}
+
+current_config() {
+    if [[ -s "${CURRENT_FILE}" ]]; then
+        cat "${CURRENT_FILE}"
+    fi
+}
+
+list_configs_random() {
+    find "${CONFIG_DIR}" -maxdepth 1 -type f -name '*.conf' -print | shuf
+}
+
+down_locked() {
+    setup_namespace
+    if wg_exists; then
+        ip -n "${NS}" link del "${WG_IF}" || true
+    fi
+}
+
+connect_config() {
+    local cfg="$1"
+    [[ -f "${cfg}" ]] || return 1
+
+    setup_namespace
+    down_locked
+
+    # wg(8) accepts the WireGuard fields only; wg-quick strip removes Address,
+    # DNS and other wg-quick-only keys from the Mullvad-generated config.
+    wg-quick strip "${cfg}" > "${STRIPPED_FILE}"
+    chmod 600 "${STRIPPED_FILE}"
+
+    # Critical namespace design: create the WireGuard interface on the HOST,
+    # then move it into the restricted namespace. WireGuard keeps its encrypted
+    # UDP socket in the namespace where it was born (the host), so the tunnel can
+    # use the VPS's normal ens3 route while cleartext processes in ${NS} see only
+    # lo + ${WG_IF}. There is therefore no non-VPN fallback path to leak through.
+    ip link del "${WG_IF}" 2>/dev/null || true
+    ip link add dev "${WG_IF}" type wireguard
+    ip link set "${WG_IF}" netns "${NS}"
+
+    ip netns exec "${NS}" wg setconf "${WG_IF}" "${STRIPPED_FILE}"
+
+    local address_line
+    address_line="$(sed -n 's/^[[:space:]]*Address[[:space:]]*=[[:space:]]*//Ip' "${cfg}" | head -n1)"
+    [[ -n "${address_line}" ]] || { ip -n "${NS}" link del "${WG_IF}" || true; return 1; }
+
+    local addr
+    IFS=',' read -r -a _addrs <<< "${address_line}"
+    for addr in "${_addrs[@]}"; do
+        addr="${addr//[[:space:]]/}"
+        [[ -n "${addr}" ]] || continue
+        ip -n "${NS}" address add "${addr}" dev "${WG_IF}"
+    done
+
+    ip -n "${NS}" link set dev "${WG_IF}" mtu "${MTU}"
+    ip -n "${NS}" link set dev "${WG_IF}" up
+    ip -n "${NS}" route replace default dev "${WG_IF}"
+    if printf '%s\n' "${address_line}" | grep -q ':'; then
+        ip -n "${NS}" -6 route replace default dev "${WG_IF}" 2>/dev/null || true
+    fi
+
+    # Force a handshake and verify that the namespace really exits through Mullvad.
+    local i
+    for i in $(seq 1 15); do
+        if connected; then
+            printf '%s\n' "${cfg}" > "${CURRENT_FILE}"
+            chmod 600 "${CURRENT_FILE}"
+            echo "Connected: $(basename "${cfg}")"
+            return 0
+        fi
+        sleep 1
+    done
+
+    ip -n "${NS}" link del "${WG_IF}" 2>/dev/null || true
+    return 1
+}
+
+connect_from_candidates() {
+    local avoid="${1:-}"
+    local -a configs=()
+    mapfile -t configs < <(list_configs_random)
+    (( ${#configs[@]} > 0 )) || die "No WireGuard configs in ${CONFIG_DIR}"
+
+    local cfg attempts=0
+    for cfg in "${configs[@]}"; do
+        [[ -n "${avoid}" && "${cfg}" == "${avoid}" && ${#configs[@]} -gt 1 ]] && continue
+        attempts=$((attempts + 1))
+        echo "Trying relay: $(basename "${cfg}")"
+        if connect_config "${cfg}"; then
+            return 0
+        fi
+        (( attempts >= 5 )) && break
+    done
+    return 1
+}
+
+ensure_locked() {
+    setup_namespace
+    if connected; then
+        return 0
+    fi
+
+    local cur=""
+    cur="$(current_config || true)"
+    if [[ -n "${cur}" && -f "${cur}" ]]; then
+        echo "Reconnecting current relay: $(basename "${cur}")"
+        if connect_config "${cur}"; then
+            return 0
+        fi
+    fi
+
+    connect_from_candidates "${cur}" || die "Unable to establish Mullvad WireGuard tunnel"
+}
+
+rotate_locked() {
+    setup_namespace
+
+    local now last=0
+    now="$(date +%s)"
+    if [[ -s "${LAST_ROTATE_FILE}" ]]; then
+        last="$(cat "${LAST_ROTATE_FILE}" 2>/dev/null || echo 0)"
+    fi
+
+    # Several concurrent yt-dlp jobs can observe the same dying IP at once. The
+    # first worker rotates; later workers arriving during this small cooldown use
+    # the already-fresh tunnel instead of immediately rotating it again.
+    if (( now - last < ROTATE_COOLDOWN )) && connected; then
+        echo "Rotation already completed recently; keeping fresh relay."
+        return 0
+    fi
+
+    local cur=""
+    cur="$(current_config || true)"
+    connect_from_candidates "${cur}" || die "Unable to rotate Mullvad WireGuard tunnel"
+    date +%s > "${LAST_ROTATE_FILE}"
+    chmod 600 "${LAST_ROTATE_FILE}"
+}
+
+with_lock() {
+    exec 9>"${LOCK_FILE}"
+    flock -x 9
+    "$@"
+}
+
+command="${1:-}"
+[[ -n "${command}" ]] || die "Usage: ytpdl-vpn namespace|ensure|rotate|status|ip|down|exec -- COMMAND..."
+shift || true
+
+case "${command}" in
+    namespace)
+        setup_namespace
+        ;;
+    ensure)
+        with_lock ensure_locked
+        ;;
+    rotate)
+        with_lock rotate_locked
+        ;;
+    status)
+        if connected; then
+            echo "Connected"
+            if [[ -s "${CURRENT_FILE}" ]]; then
+                echo "Relay config: $(basename "$(cat "${CURRENT_FILE}")")"
+            fi
+            ip netns exec "${NS}" curl -fsS --connect-timeout 4 --max-time 8 "${CHECK_URL}" || true
+            exit 0
+        fi
+        echo "Disconnected" >&2
+        exit 1
+        ;;
+    ip)
+        connected || die "VPN namespace is not connected"
+        exec ip netns exec "${NS}" curl -fsS --connect-timeout 4 --max-time 8 "${IP_URL}"
+        ;;
+    down)
+        with_lock down_locked
+        ;;
+    exec)
+        [[ "${1:-}" == "--" ]] && shift
+        (( $# > 0 )) || die "exec requires a command"
+        wg_exists || die "VPN namespace is not connected"
+        exec ip netns exec "${NS}" "$@"
+        ;;
+    *)
+        die "Unknown command '${command}'"
+        ;;
+esac
+EOF2
+chmod 755 "${VPN_HELPER}"
+
+cat > /etc/systemd/system/ytpdl-vpn-namespace.service <<EOF2
+[Unit]
+Description=ytp-dl isolated network namespace
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${VPN_HELPER} namespace
+ExecStop=${VPN_HELPER} down
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF2
+
+systemctl daemon-reload
+systemctl enable --now ytpdl-vpn-namespace.service
+
+log "4) Install Deno system-wide"
+if ! command -v deno >/dev/null 2>&1; then
+    curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh -s -- --yes --no-modify-path
+fi
+
+log "5) Install ytp-dl ${YTPDL_VERSION} and latest yt-dlp pre-release"
+mkdir -p "${APP_DIR}"
+if [[ ! -d "${VENV_DIR}" ]]; then
+    python3 -m venv "${VENV_DIR}"
+fi
+source "${VENV_DIR}/bin/activate"
+pip install --upgrade pip
+pip install --upgrade "ytp-dl==${YTPDL_VERSION}"
+pip install --upgrade --pre "yt-dlp[default,curl-cffi]"
+if [[ "${YTPDL_R2_UPLOAD}" == "1" ]]; then
+    pip install --upgrade boto3
+fi
+deactivate
+
+log "6) Configure API environment"
+cat > /etc/default/ytp-dl-api <<EOF2
+YTPDL_MAX_CONCURRENT=${YTPDL_MAX_CONCURRENT}
+YTPDL_VENV=${VENV_DIR}
+YTPDL_VPN_HELPER=${VPN_HELPER}
+YTPDL_SLOT_DIR=/run/ytpdl-slots
+YTPDL_ACTIVE_LOCK_DIR=/run/ytpdl-active
+YTPDL_MIN_FREE_DISK_MB=${YTPDL_MIN_FREE_DISK_MB}
+YTPDL_R2_ZIP_PART_SIZE_MB=${YTPDL_R2_ZIP_PART_SIZE_MB}
+YTPDL_R2_ZIP_WORKERS=${YTPDL_R2_ZIP_WORKERS}
+GUNICORN_WORKERS=${GUNICORN_WORKERS}
+GUNICORN_THREADS=${GUNICORN_THREADS}
+YTPDL_R2_UPLOAD=${YTPDL_R2_UPLOAD}
+R2_ENDPOINT=${R2_ENDPOINT}
+R2_BUCKET=${R2_BUCKET}
+R2_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID}
+R2_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY}
+AWS_EC2_METADATA_DISABLED=true
+YTPDL_VPS_API_TOKEN=${YTPDL_VPS_API_TOKEN}
+EOF2
+chmod 600 /etc/default/ytp-dl-api
+mkdir -p /run/ytpdl-slots /run/ytpdl-active
+chmod 700 /run/ytpdl-slots /run/ytpdl-active
+
+log "7) Install Gunicorn systemd service"
+cat > /etc/systemd/system/ytp-dl-api.service <<EOF2
+[Unit]
+Description=Gunicorn for ytp-dl API
+After=network-online.target ytpdl-vpn-namespace.service
+Wants=network-online.target ytpdl-vpn-namespace.service
+
+[Service]
+User=root
+WorkingDirectory=${APP_DIR}
+EnvironmentFile=/etc/default/ytp-dl-api
+Environment=VIRTUAL_ENV=${VENV_DIR}
+Environment=PATH=${VENV_DIR}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+RuntimeDirectory=ytpdl-slots ytpdl-active
+RuntimeDirectoryMode=0700
+ExecStart=${VENV_DIR}/bin/gunicorn \
+    -k gthread \
+    -w \${GUNICORN_WORKERS} \
+    --threads \${GUNICORN_THREADS} \
+    --timeout 0 \
+    --graceful-timeout 15 \
+    --keep-alive 20 \
+    --bind 0.0.0.0:${PORT} \
+    scripts.api:app
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+MemoryMax=${YTPDL_MEMORY_MAX}
+
+[Install]
+WantedBy=multi-user.target
+EOF2
+
+systemctl daemon-reload
+systemctl enable --now ytp-dl-api.service
+sleep 3
+
+log "8) Verify API and isolated VPN"
+curl -fsS --connect-timeout 5 "http://127.0.0.1:${PORT}/healthz"
+echo
+
+# This test touches only the isolated namespace. It must not alter the host's
+# default route, SSH connectivity or public API route.
+if "${VPN_HELPER}" ensure; then
+    echo "VPN namespace check: OK"
+    "${VPN_HELPER}" status || true
+    echo -n "VPN exit IP: "
+    "${VPN_HELPER}" ip || true
+    echo
+else
+    echo "WARNING: API is installed, but the isolated Mullvad tunnel test failed." >&2
+    echo "Check: ${VPN_HELPER} status" >&2
+fi
+
+log "Installation complete"
+echo "API: http://0.0.0.0:${PORT}"
+echo "Global download capacity: ${YTPDL_MAX_CONCURRENT} jobs"
+echo "Free-disk reserve: ${YTPDL_MIN_FREE_DISK_MB} MB"
+echo "Gunicorn: ${GUNICORN_WORKERS} workers x ${GUNICORN_THREADS} threads"
+echo "Service memory limit: ${YTPDL_MEMORY_MAX}"
+echo "VPN namespace: ${VPN_NAMESPACE}"
+echo "Mullvad relay filter: ${YTPDL_MULLVAD_LOCATION}"
+echo
+echo "Useful commands:"
+echo "  systemctl status ytp-dl-api.service --no-pager"
+echo "  journalctl -u ytp-dl-api.service -f"
+echo "  ${VPN_HELPER} status"
+echo "  ${VPN_HELPER} ip"
+echo "  ${VPN_HELPER} rotate"
+echo "  ip netns exec ${VPN_NAMESPACE} ip addr"
+```
+
+## Python client example
+
+The following script shows how to call a deployed ytp-dl API from Python, stream download output, and fetch the completed file.
 
 ### Usage
 
 ```bash
-# Single video — MP4
-python3 ytp-dl.py --base "http://YOUR_VPS_IP:5000" --url "https://www.youtube.com/watch?v=dQw4w9WgXcQ" --extension mp4 --resolution 1080 --out-dir .
+# MP4
+python3 ytp-dl.py --base "http://YOUR_VPS_IP:5000" --url "https://www.youtube.com/watch?v=dQw4w9WgXcQ" --extension mp4 --resolution 1080
 
-# Audio — MP3
-python3 ytp-dl.py --base "http://YOUR_VPS_IP:5000" --url "https://soundcloud.com/artist/track" --extension mp3 --out-dir .
+# MP3
+python3 ytp-dl.py --base "http://YOUR_VPS_IP:5000" --url "https://soundcloud.com/artist/track" --extension mp3
 
-# Playlist with retries
+# Playlist
 python3 ytp-dl.py --base "http://YOUR_VPS_IP:5000" --url "https://www.youtube.com/playlist?list=PLxxx" --extension mp4 --out-dir ./downloads
 ```
 
-Set `YTPDL_BASE` in your environment to avoid passing `--base` every time:
-
-```bash
-export YTPDL_BASE="http://YOUR_VPS_IP:5000"
-python3 ytp-dl.py --url "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-```
-
-### Arguments
-
-| Argument | Default | Description |
-|---|---|---|
-| `--base` | `$YTPDL_BASE` or `http://127.0.0.1:5000` | VPS base URL |
-| `--url` | *(required)* | Media URL to download |
-| `--extension` | `mp4` | `mp4`, `mp3`, or `best` |
-| `--resolution` | `1080` | Max height cap (ignored for `mp3`) |
-| `--metadata` | *(off)* | Emit per-file title/artist + thumbnail to the client (Media Session controls) |
-| `--out-dir` | `.` | Directory to save the file |
-| `--token` | `$YTPDL_VPS_API_TOKEN` or *(empty)* | Sent as the `X-YTPDL-Token` header; only needed if the server sets `YTPDL_VPS_API_TOKEN` |
-| `--max-retries` | `5` | Retries on server-side error, e.g. rate-limit |
-| `--retry-delay` | `1` | Seconds before first retry; doubles each attempt (max 60s) |
-| `--retry-factor` | `2` | Backoff multiplier applied after each retry |
-| `--connect-timeout` | `15` | Connection timeout in seconds |
-| `--read-timeout` | `300` | Read timeout in seconds |
-
-### Retry behavior
-
-On any server-side error (rate-limit, VPN cycle, etc.), the script retries automatically up to `--max-retries` times with exponential backoff (`--retry-delay` × `--retry-factor` each attempt, capped at 60s). It reuses the same `job_id` on each attempt — for playlist downloads, the VPS `.ytdlp-archive` skips already-completed tracks so nothing is re-downloaded.
-
-### Installation
-
-```bash
-pip install requests
-```
-
-Save the script as `ytp-dl.py`, then run it with the usage examples above.
-
-### Script
+Set `YTPDL_BASE` to avoid passing `--base` each time. If API authentication is enabled, set `YTPDL_VPS_API_TOKEN` or pass `--token`.
 
 ```python
 #!/usr/bin/env python3
@@ -192,8 +730,8 @@ Flow:
   1) POST /api/download         -> streams yt-dlp logs as Server-Sent Events (SSE)
   2) GET  /api/fetch/<job_id>   -> downloads the finished file
 
-On rate-limit ([error] from server), re-POSTs with the same job_id so the
-VPS .ytdlp-archive skips already-downloaded tracks (playlist resume).
+On a server-emitted [error] event (for example a rate-limit), re-POSTs with
+the same job_id so the VPS .ytdlp-archive can resume playlist work.
 
 Requirements:
   pip install requests
@@ -434,7 +972,7 @@ def parse_args(argv: list[str]) -> Config:
     p.add_argument("--connect-timeout", type=float, default=15.0)
     p.add_argument("--read-timeout", type=float, default=300.0)
     p.add_argument("--max-retries", type=int, default=5,
-                   help="Max retries on server-side error, e.g. rate-limit (default: 5)")
+                   help="Maximum total SSE attempts after server [error] events (default: 5)")
     p.add_argument("--retry-delay", type=float, default=1.0,
                    help="Seconds before first retry; doubles each attempt (default: 1)")
     p.add_argument("--retry-factor", type=float, default=2.0,
@@ -478,7 +1016,7 @@ def main(argv: list[str]) -> int:
         if error_msg is None:
             break
 
-        # Server signalled an error (rate-limit, VPN cycle needed, etc.)
+        # Server emitted an SSE [error] event (rate-limit, VPN cycle needed, etc.)
         if attempt >= cfg.max_retries:
             print(
                 f"ERROR: Server error after {attempt} attempt(s): {error_msg}",
@@ -511,411 +1049,4 @@ def main(argv: list[str]) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
-```
-
----
-
-## Configuration
-
-Runtime config lives in `/etc/default/ytp-dl-api` (the installer creates it). Edit the file and restart the service to apply changes.
-
-### Installer-only variables
-
-| Variable | Description | Default |
-|---|---|---:|
-| `PORT` | API server port | `5000` |
-| `APP_DIR` | Installation directory | `/opt/yt-dlp-mullvad` |
-| `MV_ACCOUNT` | Mullvad account number (required; one-time login) | *(empty)* |
-
-### Runtime variables
-
-These are read from `/etc/default/ytp-dl-api`. You can also export any of them before running the installer to pre-seed that file.
-
-| Variable | Description | Default |
-|---|---|---:|
-| `YTPDL_VENV` | Path to virtualenv for ytp-dl | `/opt/yt-dlp-mullvad/venv` |
-| `YTPDL_MULLVAD_LOCATION` | Mullvad relay location code | `us` |
-| `YTPDL_MAX_CONCURRENT` | Maximum concurrent download jobs | `1` |
-| `YTPDL_DONE_TTL_S` | Seconds to keep a completed job dir before deletion | `300` |
-| `YTPDL_STALE_JOB_TTL_S` | Seconds before an unfinished/unfetched job dir is force-deleted | `3600` |
-| `YTPDL_MIN_FREE_DISK_MB` | Minimum free disk MB — new jobs refused and emergency cleanup triggered below this threshold | `500` |
-| `YTPDL_CLEANUP_INTERVAL_S` | How often the background cleanup thread runs in seconds | `60` |
-| `YTPDL_JOB_TIMEOUT_S` | Hard kill timeout for a single-file yt-dlp process | `1800` |
-| `YTPDL_PLAYLIST_JOB_TIMEOUT_S` | Hard kill timeout for a playlist yt-dlp process | `21600` |
-| `GUNICORN_WORKERS` | Gunicorn worker processes | `1` |
-| `GUNICORN_THREADS` | Threads per Gunicorn worker | `4` |
-| `YTPDL_R2_UPLOAD` | Upload completed files to R2 | `0` |
-| `R2_ENDPOINT` | R2 endpoint (no bucket suffix) | *(empty)* |
-| `R2_BUCKET` | R2 bucket name | *(empty)* |
-| `R2_ACCESS_KEY_ID` | R2 uploader access key id | *(empty)* |
-| `R2_SECRET_ACCESS_KEY` | R2 uploader secret access key | *(empty)* |
-| `AWS_EC2_METADATA_DISABLED` | Disable EC2 metadata fetch | `true` |
-| `YTPDL_VPS_API_TOKEN` | Shared secret to authenticate requests to this API. Must be set to the same value in client-side env. Leave empty to disable auth. | *(empty)* |
-
-To change runtime configuration:
-
-```bash
-sudo nano /etc/default/ytp-dl-api
-sudo systemctl restart ytp-dl-api
-```
-
-Keep secrets (e.g. `R2_SECRET_ACCESS_KEY`) on the server only — do not commit them to repos or READMEs.
-
----
-
-## Managing your VPS service
-
-```bash
-sudo systemctl status ytp-dl-api
-sudo journalctl -u ytp-dl-api -f
-sudo systemctl restart ytp-dl-api
-sudo systemctl stop ytp-dl-api
-sudo systemctl start ytp-dl-api
-```
-
----
-
-## API reference
-
-### `POST /api/download` (SSE logs)
-
-Request body:
-
-```json
-{
-  "url": "string (required)",
-  "resolution": "integer (optional, default: 1080)",
-  "extension": "string (optional: 'mp4', 'mp3', or 'best')",
-  "job_id": "string (optional, recommended for fetch; [A-Za-z0-9_-])",
-  "metadata": "boolean (optional, default: false)"
-}
-```
-
-- `mp4` — 1080p H.264 + AAC, no transcoding
-- `mp3` — best audio stream, output as MP3 with cover art and title/artist tags embedded in the file
-- `best` — yt-dlp selects the highest quality adaptive format; `resolution` is ignored
-- `metadata` — when `true`, the job emits per-file `[meta]` (title/artist) and `[meta_thumb]` (artwork) events to the client as it runs, plus a sidecar thumbnail, to drive Media Session controls. Defaults to `false`.
-
-Response — `200 OK` SSE stream (`text/event-stream`):
-
-```
-data: [start] job_id=<job_id>
-data: [total_items] <n>               # playlist/multi only — track count
-data: <yt-dlp output lines>
-data: [meta] media=<filename>\ttitle=<title>\tartist=<artist>   # metadata=true only — per file
-data: [r2_upload] XX.XX%              # R2 only — per track, then the result file
-data: [r2_track] key=<object_key>     # R2 + playlist/multi only — one per uploaded track
-data: [meta_thumb] media=<filename>\tkey=<object_key>    # metadata=true + R2 — artwork in R2
-data: [meta_thumb] media=<filename>\tfile=<thumb_filename> # metadata=true, no R2 — fetch via /api/fetch
-data: [r2_tracks_incomplete]          # R2 + playlist/multi only — a track upload failed
-data: [ready] job_id=<job_id>
-data: [file] <filename>               # the media file — or the ZIP name for playlists
-data: [r2] key=<object_key>           # R2 only — the result file's key
-data: [fetch] /api/fetch/<job_id>
-data: [done]
-```
-
-Other responses:
-- `400 Bad Request` — missing or invalid URL/params
-- `503 Service Unavailable` — server busy (max concurrent downloads reached)
-
-### `GET /api/fetch/<job_id>`
-
-Returns the finished file as an attachment. The job directory is cleaned up after the response completes (or after `YTPDL_DONE_TTL_S` elapses).
-
-### `GET /api/fetch/<job_id>/<filename>`
-
-Returns a specific file from the job directory by name. Useful for fetching any secondary output files produced by a job (e.g. the ZIP of individual playlist tracks).
-
-### `GET /healthz`
-
-```json
-{
-  "ok": true,
-  "in_use": 1,
-  "capacity": 1
-}
-```
-
----
-
-## VPS deployment
-
-The included Ubuntu installer script is designed for a **fresh VPS** and sets everything up end-to-end so the public API stays reachable while Mullvad is cycling.
-
-Under the hood, Mullvad connect/disconnect can change Linux routing. Without extra routing rules, inbound connections to your API can intermittently fail (e.g., TCP handshakes time out). The installer handles this by:
-
-* **Pinning replies from your public VPS IP** to the public interface via a small policy-routing rule (so your API keeps responding on the same route).
-* **Excluding the API port from the VPN tunnel** using nftables marks (so the port stays reachable even while Mullvad is connected).
-
-It also installs all runtime dependencies and configures the API as a managed systemd service.
-
-```bash
-#!/usr/bin/env bash
-# VPS_Installation.sh - Minimal Ubuntu 24.04/25.04 setup for ytp-dl API + Mullvad
-#
-# What this does:
-#   - Installs Python, ffmpeg, Mullvad CLI
-#   - Installs Deno system-wide (JS runtime required for modern YouTube extraction via yt-dlp)
-#   - Configures policy routing so the public API stays reachable while Mullvad toggles
-#   - Adds Mullvad excluded-port rules (nftables marks) so :PORT stays reachable under VPN
-#   - Creates a virtualenv at /opt/yt-dlp-mullvad/venv
-#   - Installs ytp-dl + yt-dlp[default] + gunicorn (+ boto3 if R2 upload enabled)
-#   - (Optional) bakes in Cloudflare R2 uploader env vars
-#   - Creates a systemd service ytp-dl-api.service on port 5000
-#
-# Mullvad IP rotation is handled automatically by downloader.py.
-# VPN connects on first job and stays up. IP rotates only on bot detection.
-
-set -euo pipefail
-
-### --- Tunables -------------------------------------------------------------
-PORT="${PORT:-5000}"                           # API listen port
-APP_DIR="${APP_DIR:-/opt/yt-dlp-mullvad}"      # app/venv root
-VENV_DIR="${VENV_DIR:-${APP_DIR}/venv}"        # python venv
-
-MV_ACCOUNT="${MV_ACCOUNT:-}"                            # Mullvad account number (required)
-YTPDL_MAX_CONCURRENT="${YTPDL_MAX_CONCURRENT:-1}"       # API concurrency cap (download jobs)
-YTPDL_MULLVAD_LOCATION="${YTPDL_MULLVAD_LOCATION:-us}"  # default Mullvad relay hint
-GUNICORN_WORKERS="${GUNICORN_WORKERS:-1}"               # Gunicorn worker processes
-GUNICORN_THREADS="${GUNICORN_THREADS:-4}"               # Threads per Gunicorn worker
-
-# --- Optional R2 upload (Cloudflare R2 / S3-compatible) ----------------------
-YTPDL_R2_UPLOAD="${YTPDL_R2_UPLOAD:-0}"                 # 1 to enable upload
-R2_ENDPOINT="${R2_ENDPOINT:-}"                          # e.g. https://<accountid>.r2.cloudflarestorage.com
-R2_BUCKET="${R2_BUCKET:-}"                              # e.g. ezmdl
-R2_ACCESS_KEY_ID="${R2_ACCESS_KEY_ID:-}"                # uploader key id
-R2_SECRET_ACCESS_KEY="${R2_SECRET_ACCESS_KEY:-}"        # uploader secret
-YTPDL_VPS_API_TOKEN="${YTPDL_VPS_API_TOKEN:-}"          # shared secret — must be set to same value in client-side env; leave empty to disable
-export AWS_EC2_METADATA_DISABLED="true"
-### -------------------------------------------------------------------------
-
-[[ "${EUID}" -eq 0 ]] || { echo "Please run as root"; exit 1; }
-export DEBIAN_FRONTEND=noninteractive
-
-echo "==> 0) Capture public routing (pre-VPN)"
-PUB_DEV="$(ip route show default | awk '/default/ {print $5; exit}')"
-PUB_GW="$(ip route show default | awk '/default/ {print $3; exit}')"
-PUB_IP="$(ip -4 addr show dev "${PUB_DEV}" | awk '/inet / {print $2}' | cut -d/ -f1 | head -n1)"
-
-if [[ -z "${PUB_DEV}" || -z "${PUB_GW}" || -z "${PUB_IP}" ]]; then
-  echo "Failed to detect public routing (PUB_DEV/PUB_GW/PUB_IP)."
-  echo "PUB_DEV=${PUB_DEV} PUB_GW=${PUB_GW} PUB_IP=${PUB_IP}"
-  exit 1
-fi
-
-echo "Public dev: ${PUB_DEV} | gw: ${PUB_GW} | ip: ${PUB_IP}"
-
-echo "==> 1) Base packages & Mullvad CLI"
-apt-get update
-apt-get install -yq --no-install-recommends   python3-venv python3-pip curl ffmpeg ca-certificates unzip   iproute2 iptables nftables
-
-if ! command -v mullvad >/dev/null 2>&1; then
-  curl -fsSLo /tmp/mullvad.deb https://mullvad.net/download/app/deb/latest/
-  apt-get install -y /tmp/mullvad.deb
-fi
-
-if [[ -n "${MV_ACCOUNT}" ]]; then
-  echo "Logging into Mullvad account (if not already logged in)..."
-  mullvad account login "${MV_ACCOUNT}" || true
-fi
-
-mullvad status || true
-
-# Keep the public API reachable even if Mullvad disconnects between jobs.
-# (Lockdown mode can block all traffic while disconnected.)
-mullvad lockdown-mode set off || true
-mullvad lan set allow || true
-
-echo "==> 1.1) Policy routing: keep replies from ${PUB_IP} on ${PUB_DEV}"
-# Loose reverse-path filtering avoids drops when the default route changes under VPN.
-tee /etc/sysctl.d/99-ytpdl-policy-routing.conf >/dev/null <<EOF
-net.ipv4.conf.all.rp_filter=2
-net.ipv4.conf.default.rp_filter=2
-net.ipv4.conf.${PUB_DEV}.rp_filter=2
-EOF
-sysctl --system >/dev/null
-
-# Persist the detected public route info for re-apply at boot.
-tee /etc/default/ytpdl-policy-routing >/dev/null <<EOF
-PUB_DEV=${PUB_DEV}
-PUB_GW=${PUB_GW}
-PUB_IP=${PUB_IP}
-EOF
-
-# Add a routing table id if it doesn't already exist.
-grep -qE '^100\s+ytpdl-public$' /etc/iproute2/rt_tables || echo '100 ytpdl-public' >> /etc/iproute2/rt_tables
-
-# Idempotent apply script.
-tee /usr/local/sbin/ytpdl-policy-routing.sh >/dev/null <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-
-source /etc/default/ytpdl-policy-routing
-
-TABLE_ID="100"
-TABLE_NAME="ytpdl-public"
-PRIO="11000"
-
-# Ensure table has the public default route.
-ip route replace default via "${PUB_GW}" dev "${PUB_DEV}" table "${TABLE_NAME}"
-
-# Ensure rule exists (replace is not supported for rules).
-if ip rule show | grep -qE "^${PRIO}:.*from ${PUB_IP}/32 lookup ${TABLE_NAME}"; then
-  :
-else
-  # remove any stale rule at this priority
-  while ip rule show | grep -qE "^${PRIO}:"; do
-    ip rule del priority "${PRIO}" || true
-  done
-  ip rule add priority "${PRIO}" from "${PUB_IP}/32" table "${TABLE_NAME}"
-fi
-
-ip route flush cache || true
-EOF
-chmod +x /usr/local/sbin/ytpdl-policy-routing.sh
-
-tee /etc/systemd/system/ytpdl-policy-routing.service >/dev/null <<EOF
-[Unit]
-Description=ytp-dl policy routing (keep public API reachable)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/ytpdl-policy-routing.sh
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable --now ytpdl-policy-routing.service
-
-echo "==> 1.2) Mullvad exclude rules: keep :${PORT} reachable during VPN"
-# Uses Mullvad-documented nftables marks (advanced split tunneling).
-EXCLUDE_NFT="/etc/ytpdl-mullvad-exclude-ports.nft"
-tee "${EXCLUDE_NFT}" >/dev/null <<EOF
-table inet ytpdl_mullvad_exclusions {
-  chain allowIncoming {
-    type filter hook input priority -100; policy accept;
-    tcp dport ${PORT} ct mark set 0x00000f41 meta mark set 0x6d6f6c65
-    udp dport ${PORT} ct mark set 0x00000f41 meta mark set 0x6d6f6c65
-  }
-
-  chain allowOutgoing {
-    type route hook output priority -100; policy accept;
-    tcp sport ${PORT} ct mark set 0x00000f41 meta mark set 0x6d6f6c65
-    udp sport ${PORT} ct mark set 0x00000f41 meta mark set 0x6d6f6c65
-  }
-}
-EOF
-
-# Apply now (idempotent: it replaces/overwrites the table)
-nft -f "${EXCLUDE_NFT}"
-
-tee /etc/systemd/system/ytpdl-mullvad-exclude-ports.service >/dev/null <<EOF
-[Unit]
-Description=ytp-dl Mullvad excluded ports (nftables)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/sbin/nft -f ${EXCLUDE_NFT}
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable --now ytpdl-mullvad-exclude-ports.service
-
-echo "==> 1.5) Install Deno (system-wide, for yt-dlp YouTube extraction)"
-# Non-interactive:
-#   --yes            => skip prompts / accept defaults
-#   --no-modify-path => do NOT edit shell rc files (we install into /usr/local anyway)
-if ! command -v deno >/dev/null 2>&1; then
-  curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh -s -- --yes --no-modify-path
-fi
-
-deno --version
-
-echo "==> 2) App dir & virtualenv"
-mkdir -p "${APP_DIR}"
-python3 -m venv "${VENV_DIR}"
-source "${VENV_DIR}/bin/activate"
-pip install --upgrade pip
-
-pip install "ytp-dl==2026.6.30"
-if [[ "${YTPDL_R2_UPLOAD}" == "1" ]]; then
-  pip install boto3
-fi
-deactivate
-
-echo "==> 3) API environment file (/etc/default/ytp-dl-api)"
-tee /etc/default/ytp-dl-api >/dev/null <<EOF
-YTPDL_MAX_CONCURRENT=${YTPDL_MAX_CONCURRENT}
-YTPDL_MULLVAD_LOCATION=${YTPDL_MULLVAD_LOCATION}
-YTPDL_VENV=${VENV_DIR}
-
-GUNICORN_WORKERS=${GUNICORN_WORKERS}
-GUNICORN_THREADS=${GUNICORN_THREADS}
-
-YTPDL_R2_UPLOAD=${YTPDL_R2_UPLOAD}
-R2_ENDPOINT=${R2_ENDPOINT}
-R2_BUCKET=${R2_BUCKET}
-R2_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID}
-R2_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY}
-AWS_EC2_METADATA_DISABLED=true
-YTPDL_VPS_API_TOKEN=${YTPDL_VPS_API_TOKEN}
-EOF
-
-echo "==> 4) Gunicorn systemd service (ytp-dl-api.service on :${PORT})"
-tee /etc/systemd/system/ytp-dl-api.service >/dev/null <<EOF
-[Unit]
-Description=Gunicorn for ytp-dl Mullvad API (minimal)
-After=network-online.target ytpdl-policy-routing.service ytpdl-mullvad-exclude-ports.service
-Wants=network-online.target
-Requires=ytpdl-policy-routing.service ytpdl-mullvad-exclude-ports.service
-
-[Service]
-User=root
-WorkingDirectory=${APP_DIR}
-EnvironmentFile=/etc/default/ytp-dl-api
-Environment=VIRTUAL_ENV=${VENV_DIR}
-Environment=PATH=${VENV_DIR}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
-
-ExecStart=${VENV_DIR}/bin/gunicorn -k gthread -w ${GUNICORN_WORKERS} --threads ${GUNICORN_THREADS}   --timeout 0 --graceful-timeout 15 --keep-alive 20   --bind 0.0.0.0:${PORT} scripts.api:app
-
-Restart=always
-RestartSec=3
-LimitNOFILE=65535
-MemoryMax=1G
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-echo "==> 5) Start and enable API service"
-systemctl daemon-reload
-systemctl enable --now ytp-dl-api.service
-
-echo "==> 6) Quick status + health check"
-systemctl status ytp-dl-api --no-pager || true
-
-echo
-echo "Waiting for API to start..."
-sleep 3
-echo "Health (local):"
-curl -sS "http://127.0.0.1:${PORT}/healthz" || true
-
-echo
-echo "========================================="
-echo "Installation complete!"
-echo "API running on port ${PORT}"
-echo "Test from outside: curl http://YOUR_VPS_IP:${PORT}/healthz"
-echo "========================================="
 ```
