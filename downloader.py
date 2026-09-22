@@ -5,22 +5,20 @@ from __future__ import annotations
 
 import os
 import re
-import shlex
 import shutil
 import subprocess
-import time
 import signal
 import threading
 import zipfile
 from collections import deque
-from typing import Callable, Deque, List, Optional, Tuple
+from typing import Callable, Deque, List, Optional
 
 # =========================
 # Config / constants
 # =========================
 VENV_PATH = os.environ.get("YTPDL_VENV", "/opt/yt-dlp-mullvad/venv")
 YTDLP_BIN = os.path.join(VENV_PATH, "bin", "yt-dlp")
-MULLVAD_LOCATION = os.environ.get("YTPDL_MULLVAD_LOCATION", "us")
+VPN_HELPER = os.environ.get("YTPDL_VPN_HELPER", "/usr/local/sbin/ytpdl-vpn")
 
 MODERN_UA = os.environ.get(
     "YTPDL_USER_AGENT",
@@ -30,7 +28,6 @@ MODERN_UA = os.environ.get(
 )
 
 FFMPEG_BIN = shutil.which("ffmpeg") or "ffmpeg"
-FFMPEG_TIMEOUT_S = int(os.environ.get("YTPDL_FFMPEG_TIMEOUT_S", "1800"))
 DEFAULT_OUT_DIR = os.environ.get("YTPDL_DOWNLOAD_DIR", "/root")
 
 JOB_TIMEOUT_S = int(os.environ.get("YTPDL_JOB_TIMEOUT_S", "1800"))
@@ -72,72 +69,74 @@ except ImportError:
     _CURL_CFFI_AVAILABLE = False
 
 # =========================
-# Mullvad state (module-level, shared across all threads)
+# Isolated Mullvad/WireGuard namespace
 # =========================
-_mullvad_lock = threading.Lock()
-_mullvad_connected = False
+# The host itself never joins Mullvad.  The installer creates a dedicated
+# network namespace and exposes it through YTPDL_VPN_HELPER.  Every yt-dlp
+# process runs inside that namespace; Gunicorn, SSH and R2 stay on the host's
+# normal network.  The helper uses a host-level flock, so VPN connect/rotate
+# operations are serialized across ALL Gunicorn worker processes.
+_vpn_thread_lock = threading.Lock()
 
 
-def _mullvad_is_actually_connected() -> bool:
-    """Check live Mullvad status — guards against external disconnects."""
-    if not _mullvad_present():
-        return True
+def _vpn_helper_present() -> bool:
+    return os.path.isfile(VPN_HELPER) and os.access(VPN_HELPER, os.X_OK)
+
+
+def _vpn_command(action: str, *, timeout: int = 45) -> tuple[int, str]:
     try:
         res = subprocess.run(
-            ["mullvad", "status"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=5,
+            [VPN_HELPER, action],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout,
         )
-        return "Connected" in (res.stdout or "")
-    except Exception:
+        return res.returncode, (res.stdout or "")
+    except Exception as e:
+        return 1, str(e)
+
+
+def _vpn_is_connected() -> bool:
+    if not _vpn_helper_present():
         return False
+    rc, _ = _vpn_command("status", timeout=10)
+    return rc == 0
 
 
-def _ensure_mullvad() -> None:
-    """Connect to Mullvad only if not already connected. Thread-safe.
-    Re-validates live status so external disconnects (reboot, daemon restart)
-    are caught rather than silently using an unprotected connection."""
-    global _mullvad_connected
-    if _mullvad_connected and _mullvad_is_actually_connected():
+def _ensure_vpn() -> None:
+    """Ensure the isolated yt-dlp namespace has a working Mullvad tunnel.
+
+    The Python lock prevents duplicate work from threads in this process; the
+    helper itself also takes a filesystem lock so separate Gunicorn workers
+    cannot race each other while creating or reconfiguring `ytpdlwg`.
+    """
+    if _vpn_is_connected():
         return
-    with _mullvad_lock:
-        if _mullvad_connected and _mullvad_is_actually_connected():
+    with _vpn_thread_lock:
+        if _vpn_is_connected():
             return
-        require_mullvad_login()
-        mullvad_connect(MULLVAD_LOCATION)
-        if not mullvad_wait_connected():
-            raise RuntimeError("Mullvad connection failed")
-        _mullvad_connected = True
+        rc, out = _vpn_command("ensure", timeout=60)
+        if rc != 0:
+            raise RuntimeError(f"Mullvad namespace connection failed\n{_tail(out)}")
 
 
-def _rotate_mullvad() -> None:
-    """Rotate Mullvad IP (disconnect → connect). Called only on bot detection. Thread-safe."""
-    global _mullvad_connected
-    with _mullvad_lock:
-        mullvad_connect(MULLVAD_LOCATION)
-        if not mullvad_wait_connected():
-            raise RuntimeError("Mullvad reconnection failed")
-        _mullvad_connected = True
+def _rotate_vpn() -> None:
+    """Rotate only the isolated yt-dlp tunnel; host networking is untouched."""
+    with _vpn_thread_lock:
+        rc, out = _vpn_command("rotate", timeout=60)
+        if rc != 0:
+            raise RuntimeError(f"Mullvad namespace rotation failed\n{_tail(out)}")
+
+
+def _vpn_exec_argv(argv: List[str]) -> List[str]:
+    """Wrap a command so it executes inside the isolated VPN namespace."""
+    return [VPN_HELPER, "exec", "--", *argv]
 
 
 # =========================
 # Shell helpers
 # =========================
-def _run_argv_capture(argv: List[str]) -> Tuple[int, str]:
-    res = subprocess.run(
-        argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, timeout=FFMPEG_TIMEOUT_S,
-    )
-    return res.returncode, (res.stdout or "")
-
-
-def _run_argv(argv: List[str], check: bool = True) -> str:
-    rc, out = _run_argv_capture(argv)
-    if check and rc != 0:
-        cmd = " ".join(shlex.quote(p) for p in argv)
-        raise RuntimeError(f"Command failed: {cmd}\n{out}")
-    return out
-
-
 def _tail(out: str) -> str:
     lines = (out or "").splitlines()
     txt = "\n".join(lines[-_MAX_ERR_LINES:])
@@ -175,54 +174,18 @@ def is_playlist_url(url: str) -> bool:
 
 
 # =========================
-# Environment / Mullvad
+# Environment / VPN namespace
 # =========================
 def validate_environment() -> None:
     if not os.path.exists(YTDLP_BIN):
         raise RuntimeError(f"yt-dlp not found at {YTDLP_BIN}")
     if shutil.which(FFMPEG_BIN) is None:
         raise RuntimeError("ffmpeg not found on PATH")
-
-
-def _mullvad_present() -> bool:
-    return shutil.which("mullvad") is not None
-
-
-def mullvad_logged_in() -> bool:
-    if not _mullvad_present():
-        return False
-    res = subprocess.run(
-        ["mullvad", "account", "get"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
-    )
-    return "not logged in" not in (res.stdout or "").lower()
-
-
-def require_mullvad_login() -> None:
-    if _mullvad_present() and not mullvad_logged_in():
-        raise RuntimeError("Mullvad not logged in. Run: mullvad account login <ACCOUNT>")
-
-
-def mullvad_connect(location: Optional[str] = None) -> None:
-    if not _mullvad_present():
-        return
-    loc = (location or MULLVAD_LOCATION).strip()
-    _run_argv(["mullvad", "disconnect"], check=False)
-    if loc:
-        _run_argv(["mullvad", "relay", "set", "location", loc], check=False)
-    _run_argv(["mullvad", "connect"], check=False)
-
-
-def mullvad_wait_connected(timeout: int = 20) -> bool:
-    if not _mullvad_present():
-        return True
-    for _ in range(timeout):
-        res = subprocess.run(
-            ["mullvad", "status"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+    if not _vpn_helper_present():
+        raise RuntimeError(
+            f"VPN namespace helper not found or not executable at {VPN_HELPER}. "
+            "Run the VPS installer first."
         )
-        if "Connected" in (res.stdout or ""):
-            return True
-        time.sleep(1)
-    return False
 
 
 # =========================
@@ -298,7 +261,7 @@ def _get_url_item_count(url: str) -> int:
         return 1
     try:
         result = subprocess.run(
-            [
+            _vpn_exec_argv([
                 YTDLP_BIN,
                 "--flat-playlist",
                 "--quiet",
@@ -310,7 +273,7 @@ def _get_url_item_count(url: str) -> int:
                 "--retries", "2",
                 "--user-agent", MODERN_UA,
                 url,
-            ],
+            ]),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -416,6 +379,7 @@ def _build_ytdlp_argv(
     playlist: bool = False,
     archive_path: Optional[str] = None,
     write_metadata: bool = False,
+    finalize_progress_path: Optional[str] = None,
 ) -> List[str]:
     out_dir = os.path.abspath(out_dir)
     out_tpl = os.path.join(out_dir, "%(title)s.%(ext)s")
@@ -425,7 +389,6 @@ def _build_ytdlp_argv(
         "-f", fmt,
         *(_common_flags(playlist=playlist)),
         "--output", out_tpl,
-        "--print", "after_move:filepath",
         # Emit the resolved format_id before downloading so the frontend can size
         # its progress slots: "137+140" = a DASH video+audio merge (two download
         # phases), a bare id like "18" = one combined stream. --print output
@@ -437,6 +400,14 @@ def _build_ytdlp_argv(
         "--newline",
         "--no-color",
     ]
+
+    if finalize_progress_path:
+        # Duration is kept internal and paired with FFmpeg's machine-readable
+        # -progress output so the parent process can emit genuine finalization
+        # percentages for MP3 conversion and video merge/remux work.
+        argv.extend([
+            "--print", "before_dl:[finalize_duration] %(duration)s",
+        ])
 
     # Media Session metadata (lock-screen). Controlled per-request via the
     # `metadata` API field (write_metadata here; default off, opt-in). Adds a [meta]
@@ -452,6 +423,14 @@ def _build_ytdlp_argv(
             "--write-thumbnail",
             "--convert-thumbnails", "jpg",
         ])
+
+    # Keep the traditional bare final path for single-file jobs. For playlists,
+    # emit a tagged internal completion event after metadata so optional callers
+    # can track the completed path without exposing the server path.
+    if playlist:
+        argv.extend(["--print", "after_move:[file_done] %(filepath)s"])
+    else:
+        argv.extend(["--print", "after_move:filepath"])
 
     # For playlists, print the title once so download_playlist can name files.
     if playlist:
@@ -478,6 +457,13 @@ def _build_ytdlp_argv(
             "--audio-quality", "0",
             "--embed-thumbnail",           # cover art in ID3
         ])
+        if finalize_progress_path:
+            # Scope -progress to the actual audio conversion only. Thumbnail and
+            # metadata FFmpeg work stay out of the user-facing finalize stream.
+            argv.extend([
+                "--postprocessor-args",
+                f"ExtractAudio+ffmpeg:-progress {finalize_progress_path} -nostats",
+            ])
         # Ensure the embedded art is JPG. When metadata is on this is already
         # present globally; add it here too so MP3 cover art is still converted
         # when metadata is off. yt-dlp de-dupes repeated flags, so it's harmless.
@@ -487,6 +473,16 @@ def _build_ytdlp_argv(
         # Video: no --embed-thumbnail to avoid unwanted container changes.
         if merge_output_format:
             argv.extend(["--merge-output-format", merge_output_format])
+        if finalize_progress_path:
+            # yt-dlp may finalize video by merging separate video/audio streams,
+            # remuxing containers, or (less commonly) converting video. Attach
+            # FFmpeg -progress only to those media postprocessors so unrelated
+            # thumbnail/metadata work cannot generate misleading percentages.
+            for pp_name in ("Merger", "VideoRemuxer", "VideoConvertor"):
+                argv.extend([
+                    "--postprocessor-args",
+                    f"{pp_name}+ffmpeg:-progress {finalize_progress_path} -nostats",
+                ])
 
     # Sites with no dedicated extractor fall back to yt-dlp's [generic]
     # extractor. When such a site sits behind Cloudflare, the default TLS
@@ -557,6 +553,137 @@ def _square_embedded_cover(mp3_path: str) -> None:
 
 
 # =========================
+# FFmpeg finalization progress
+# =========================
+def _parse_ffmpeg_clock(value: str) -> Optional[float]:
+    """Parse FFmpeg HH:MM:SS.microseconds progress time into seconds."""
+    try:
+        hours, minutes, seconds = (value or "").strip().split(":", 2)
+        return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+    except (TypeError, ValueError):
+        return None
+
+
+def _monitor_finalize_fifo(
+    *,
+    fifo_path: str,
+    duration_state: dict,
+    stop_event: threading.Event,
+    on_line: Callable[[str], None],
+    progress_state: Optional[dict] = None,
+) -> None:
+    """Translate FFmpeg ``-progress`` records into ``[finalize]`` SSE lines.
+
+    The FIFO is opened read/write and non-blocking by this process. Keeping a
+    local write descriptor open prevents EOF between sequential playlist tracks,
+    while still allowing sequential FFmpeg postprocessors to open the FIFO for
+    writing immediately.
+    """
+    fd: Optional[int] = None
+    try:
+        fd = os.open(fifo_path, os.O_RDWR | os.O_NONBLOCK)
+        buf = ""
+        active = False
+        last_pct = -1.0
+        state = progress_state if progress_state is not None else {}
+        state.update({"seen": False, "active": False, "last_pct": -1.0})
+
+        def emit(pct: float) -> None:
+            nonlocal last_pct
+            pct = max(0.0, min(100.0, pct))
+            # FFmpeg normally reports twice per second. Avoid duplicate records
+            # while still keeping two-decimal precision for genuine movement.
+            if pct < 100.0 and last_pct >= 0.0 and pct < last_pct + 0.10:
+                return
+            last_pct = pct
+            state["seen"] = True
+            state["last_pct"] = pct
+            try:
+                on_line(f"[finalize] {pct:.2f}%")
+            except Exception:
+                # Progress reporting is best-effort and must never break the
+                # actual media finalization if the client disappears mid-job.
+                pass
+
+        # Once stop_event is set, make one final non-blocking drain of anything
+        # FFmpeg already wrote before exiting. The old `while not stop_event...`
+        # loop could stop before consuming the terminal `progress=end` record.
+        while True:
+            try:
+                chunk = os.read(fd, 8192)
+            except BlockingIOError:
+                if stop_event.is_set():
+                    break
+                stop_event.wait(0.10)
+                continue
+            except OSError:
+                break
+
+            if not chunk:
+                if stop_event.is_set():
+                    break
+                stop_event.wait(0.10)
+                continue
+
+            buf += chunk.decode("utf-8", errors="replace")
+            while "\n" in buf:
+                raw, buf = buf.split("\n", 1)
+                line = raw.strip()
+                if not line or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+
+                if key in {"out_time_us", "out_time_ms", "out_time"}:
+                    if not active:
+                        active = True
+                        state["active"] = True
+                        last_pct = -1.0
+                        emit(0.0)
+
+                    elapsed: Optional[float] = None
+                    if key in {"out_time_us", "out_time_ms"}:
+                        try:
+                            # FFmpeg's machine-readable progress values are in
+                            # microseconds (out_time_us is explicit; out_time_ms
+                            # is the legacy name for the same unit).
+                            elapsed = float(value) / 1_000_000.0
+                        except ValueError:
+                            elapsed = None
+                    else:
+                        elapsed = _parse_ffmpeg_clock(value)
+
+                    try:
+                        duration = float(duration_state.get("seconds") or 0.0)
+                    except (TypeError, ValueError):
+                        duration = 0.0
+
+                    if elapsed is not None and duration > 0.0:
+                        # Reserve exactly 100% for FFmpeg's progress=end event;
+                        # extractor duration metadata can be slightly rounded.
+                        emit(min(99.90, (elapsed / duration) * 100.0))
+
+                elif key == "progress" and value == "end":
+                    if not active:
+                        active = True
+                        state["active"] = True
+                        last_pct = -1.0
+                        emit(0.0)
+                    emit(100.0)
+                    active = False
+                    state["active"] = False
+                    state["last_pct"] = 100.0
+                    last_pct = -1.0
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+# =========================
 # Core streaming downloader
 # =========================
 def _download_with_format_stream(
@@ -571,16 +698,57 @@ def _download_with_format_stream(
     abort_event: Optional[threading.Event] = None,
     archive_path: Optional[str] = None,
     write_metadata: bool = False,
+    on_file_done: Optional[Callable[[str], None]] = None,
 ) -> "str | List[str]":
     """
     Streams yt-dlp stdout line-by-line via on_line.
 
     Returns:
       str       — path to single downloaded file   (playlist=False)
-      List[str] — ordered paths for all tracks     (playlist=True)
+      List[str] — ordered paths completed in this invocation (playlist=True)
+
+    When playlist=True and on_file_done is provided, yt-dlp emits a tagged
+    after_move event for each fully post-processed track and invokes the callback.
+    The production API keeps this hook lightweight; R2 transfer happens only
+    after the collection download phase has finished.
     """
     out_dir = os.path.abspath(out_dir)
     os.makedirs(out_dir, exist_ok=True)
+
+    finalize_fifo: Optional[str] = None
+    finalize_stop: Optional[threading.Event] = None
+    finalize_thread: Optional[threading.Thread] = None
+    finalize_duration = {"seconds": 0.0}
+    finalize_progress_state = {"seen": False, "active": False, "last_pct": -1.0}
+
+    # One private FIFO per yt-dlp invocation. Failure to create it simply
+    # disables finalization progress reporting; the download itself still proceeds.
+    candidate = os.path.join(
+        out_dir,
+        f".ytpdl-finalize-{os.getpid()}-{threading.get_ident()}-{id(finalize_duration):x}.fifo",
+    )
+    try:
+        if os.path.exists(candidate):
+            os.unlink(candidate)
+        os.mkfifo(candidate, 0o600)
+        finalize_fifo = candidate
+        finalize_stop = threading.Event()
+        finalize_thread = threading.Thread(
+            target=_monitor_finalize_fifo,
+            kwargs={
+                "fifo_path": finalize_fifo,
+                "duration_state": finalize_duration,
+                "stop_event": finalize_stop,
+                "on_line": on_line,
+                "progress_state": finalize_progress_state,
+            },
+            daemon=True,
+        )
+        finalize_thread.start()
+    except OSError:
+        finalize_fifo = None
+        finalize_stop = None
+        finalize_thread = None
 
     argv = _build_ytdlp_argv(
         url=url, out_dir=out_dir, fmt=fmt,
@@ -588,6 +756,7 @@ def _download_with_format_stream(
         extract_mp3=extract_mp3, playlist=playlist,
         archive_path=archive_path,
         write_metadata=write_metadata,
+        finalize_progress_path=finalize_fifo,
     )
 
     tail_lines: Deque[str] = deque(maxlen=_MAX_ERR_LINES)
@@ -603,10 +772,23 @@ def _download_with_format_stream(
             candidates.append(p)
 
     timeout_s = PLAYLIST_JOB_TIMEOUT_S if playlist else JOB_TIMEOUT_S
-    proc = subprocess.Popen(
-        argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1, start_new_session=True,
-    )
+    rc: Optional[int] = None
+    try:
+        proc = subprocess.Popen(
+            _vpn_exec_argv(argv), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1, start_new_session=True,
+        )
+    except Exception:
+        if finalize_stop is not None:
+            finalize_stop.set()
+        if finalize_thread is not None:
+            finalize_thread.join(timeout=1.0)
+        if finalize_fifo:
+            try:
+                os.unlink(finalize_fifo)
+            except OSError:
+                pass
+        raise
     assert proc.stdout is not None
 
     stop_killer = threading.Event()
@@ -632,8 +814,33 @@ def _download_with_format_stream(
             s = (line or "").rstrip("\n")
             if not s:
                 continue
-            on_line(s)
             tail_lines.append(s)
+
+            if s.startswith("[finalize_duration] "):
+                raw_duration = s[len("[finalize_duration] "):].strip()
+                try:
+                    parsed_duration = float(raw_duration)
+                    finalize_duration["seconds"] = parsed_duration if parsed_duration > 0 else 0.0
+                except (TypeError, ValueError):
+                    finalize_duration["seconds"] = 0.0
+                continue
+
+            # Playlist item completion is an internal hook, not a public SSE
+            # event. yt-dlp emits it only after post-processing/moving is complete.
+            if playlist and s.startswith("[file_done] "):
+                p = s[len("[file_done] "):].strip().strip("'\"")
+                if p and not os.path.isabs(p):
+                    p = os.path.join(out_dir, p)
+                if p:
+                    p = os.path.abspath(p)
+                    _maybe_add_candidate(p)
+                    if extract_mp3 and os.path.exists(p):
+                        _square_embedded_cover(p)
+                    if on_file_done is not None and os.path.exists(p):
+                        on_file_done(p)
+                continue
+
+            on_line(s)
 
             # If abort was signaled (e.g. rate-limited), kill yt-dlp immediately
             # rather than waiting for it to exhaust retries on every remaining track.
@@ -652,10 +859,10 @@ def _download_with_format_stream(
                 if abort_event is not None:
                     if not abort_event.is_set():
                         abort_event.set()
-                        _rotate_mullvad()
+                        _rotate_vpn()
                 else:
                     # Single video path — rotate and let yt-dlp fail naturally.
-                    _rotate_mullvad()
+                    _rotate_vpn()
 
             if os.path.isabs(s) and s.startswith(out_dir):
                 _maybe_add_candidate(s)
@@ -677,16 +884,69 @@ def _download_with_format_stream(
                     pass
 
         rc = proc.wait()
+    except Exception:
+        # If a per-file callback fails, do not leave yt-dlp running in the
+        # background with nobody draining its stdout pipe.
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+        raise
     finally:
         stop_killer.set()
         try:
             proc.stdout.close()
         except Exception:
             pass
+        if finalize_stop is not None:
+            finalize_stop.set()
+        if finalize_thread is not None:
+            finalize_thread.join(timeout=1.0)
+
+        # Successful yt-dlp completion guarantees that any FFmpeg postprocessor
+        # it waited on also completed. If a finalization pass started but its
+        # terminal progress record was still missed, close that real operation
+        # at 100% instead of leaving the public log stranded below completion.
+        if (
+            rc == 0
+            and finalize_progress_state.get("seen")
+            and finalize_progress_state.get("active")
+            and (finalize_thread is None or not finalize_thread.is_alive())
+        ):
+            try:
+                on_line("[finalize] 100.00%")
+            except Exception:
+                pass
+            finalize_progress_state["active"] = False
+            finalize_progress_state["last_pct"] = 100.0
+
+        if finalize_fifo:
+            try:
+                os.unlink(finalize_fifo)
+            except OSError:
+                pass
 
     # ---- Playlist mode ----
     if playlist:
-        # Scan the entire output directory so we capture files downloaded in
+        # Completion-hook callers may mutate files after each tagged after_move
+        # event, so for that optional mode the captured events are authoritative.
+        if on_file_done is not None:
+            found = list(candidates)
+            if not found and rc != 0:
+                raise RuntimeError(
+                    f"yt-dlp failed (playlist, format: {fmt})\n{_tail(chr(10).join(tail_lines))}"
+                )
+            return found
+
+        # Local-ZIP mode: scan the entire output directory so we capture files downloaded in
         # PREVIOUS retry runs too.  Those were recorded in --download-archive
         # and silently skipped by yt-dlp this run, so they never appeared in
         # `candidates` — meaning a naive candidates-only approach would omit
@@ -714,8 +974,9 @@ def _download_with_format_stream(
             found = [p for p in candidates if p and os.path.exists(p)]
 
         if not found and rc != 0:
+            tail_error = _tail("\n".join(tail_lines))
             raise RuntimeError(
-                f"yt-dlp failed (playlist, format: {fmt})\n{_tail('\n'.join(tail_lines))}"
+                f"yt-dlp failed (playlist, format: {fmt})\n{tail_error}"
             )
         if extract_mp3:
             for _f in found:
@@ -778,15 +1039,20 @@ def download_playlist(
     out_dir: str = DEFAULT_OUT_DIR,
     on_line: Callable[[str], None],
     write_metadata: bool = False,
+    on_file_done: Optional[Callable[[str], None]] = None,
+    skip_collection_zip: bool = False,
 ) -> str:
     """
     Download every track in a playlist.
 
-    Returns the path to a ZIP of the individual tracks — the job's primary
-    result. The worker uploads each track and the ZIP to R2.
+    By default this preserves standalone/local behavior and returns a real ZIP
+    on disk. API callers with R2 enabled can set skip_collection_zip=True so
+    the media files remain local while api.py streams the final ZIP directly
+    from those local files into R2, avoiding a second full-size local copy.
+    on_file_done remains available as a lightweight completion hook for callers.
 
     On 429/bot-detection, kills yt-dlp immediately and raises RuntimeError
-    so Render's existing retry loop fires and cycles the Mullvad IP.
+    so Render's existing retry loop fires and rotates the isolated Mullvad IP.
     A --download-archive file in out_dir ensures already-downloaded tracks
     are skipped on retry — no duplicate downloads.
     """
@@ -794,7 +1060,7 @@ def download_playlist(
     os.makedirs(out_dir, exist_ok=True)
 
     validate_environment()
-    _ensure_mullvad()
+    _ensure_vpn()
 
     # Emit total item count before downloading so the frontend can scale
     # the progress bar correctly from the very first track.
@@ -824,50 +1090,51 @@ def download_playlist(
                 pass
         if (_BOT_RX.search(line) or _PH_BOT_RX.search(line)) and not abort_event.is_set():
             abort_event.set()
-            _rotate_mullvad()
+            _rotate_vpn()
             _orig_on_line("[info] Rate limited — rotating VPN IP and retrying")
         _orig_on_line(line)
 
     on_line = _capturing_on_line
 
-    try:
-        if mode == "mp3":
+    # Preserve a logical cumulative list for optional completion-hook callers.
+    _completed_files: List[str] = []
+    _completed_seen: set[str] = set()
+
+    def _track_done(path: str) -> None:
+        ap = os.path.abspath(path)
+        if ap not in _completed_seen:
+            _completed_seen.add(ap)
+            _completed_files.append(ap)
+        if on_file_done is not None:
+            on_file_done(ap)
+
+    _completion_cb = _track_done if on_file_done is not None else None
+
+    if mode == "mp3":
+        files = _download_with_format_stream(
+            url=url, out_dir=out_dir, fmt="bestaudio/best",
+            merge_output_format=None, extract_mp3=True,
+            on_line=on_line, playlist=True, write_metadata=write_metadata,
+            abort_event=abort_event, archive_path=archive_path,
+            on_file_done=_completion_cb,
+        )
+    elif mode == "best":
+        try:
             files = _download_with_format_stream(
-                url=url, out_dir=out_dir, fmt="bestaudio/best",
-                merge_output_format=None, extract_mp3=True,
+                url=url, out_dir=out_dir, fmt=_fmt_best(cap),
+                merge_output_format=None, extract_mp3=False,
                 on_line=on_line, playlist=True, write_metadata=write_metadata,
                 abort_event=abort_event, archive_path=archive_path,
+                on_file_done=_completion_cb,
             )
-        elif mode == "best":
-            try:
-                files = _download_with_format_stream(
-                    url=url, out_dir=out_dir, fmt=_fmt_best(cap),
-                    merge_output_format=None, extract_mp3=False,
-                    on_line=on_line, playlist=True, write_metadata=write_metadata,
-                    abort_event=abort_event, archive_path=archive_path,
-                )
-            except Exception:
-                try:
-                    files = _download_with_format_stream(
-                        url=url, out_dir=out_dir, fmt=_fmt_mp4_apple_safe(cap),
-                        merge_output_format="mp4", extract_mp3=False,
-                        on_line=on_line, playlist=True, write_metadata=write_metadata,
-                        abort_event=abort_event, archive_path=archive_path,
-                    )
-                except Exception:
-                    files = _download_with_format_stream(
-                        url=url, out_dir=out_dir, fmt="bestvideo+bestaudio/best",
-                        merge_output_format="mp4", extract_mp3=False,
-                        on_line=on_line, playlist=True, write_metadata=write_metadata,
-                        abort_event=abort_event, archive_path=archive_path,
-                    )
-        else:  # mp4
+        except Exception:
             try:
                 files = _download_with_format_stream(
                     url=url, out_dir=out_dir, fmt=_fmt_mp4_apple_safe(cap),
                     merge_output_format="mp4", extract_mp3=False,
                     on_line=on_line, playlist=True, write_metadata=write_metadata,
                     abort_event=abort_event, archive_path=archive_path,
+                    on_file_done=_completion_cb,
                 )
             except Exception:
                 files = _download_with_format_stream(
@@ -875,81 +1142,90 @@ def download_playlist(
                     merge_output_format="mp4", extract_mp3=False,
                     on_line=on_line, playlist=True, write_metadata=write_metadata,
                     abort_event=abort_event, archive_path=archive_path,
+                    on_file_done=_completion_cb,
                 )
-
-        # If the IP was rate-limited, raise so Render's retry loop fires and
-        # cycles Mullvad. The archive file means the retry picks up where we left off.
-        if abort_event.is_set():
-            raise RuntimeError(
-                "Rate limited by YouTube — retrying with fresh VPN IP. "
-                "Already-downloaded tracks will be skipped on retry."
+    else:  # mp4
+        try:
+            files = _download_with_format_stream(
+                url=url, out_dir=out_dir, fmt=_fmt_mp4_apple_safe(cap),
+                merge_output_format="mp4", extract_mp3=False,
+                on_line=on_line, playlist=True, write_metadata=write_metadata,
+                abort_event=abort_event, archive_path=archive_path,
+                on_file_done=_completion_cb,
+            )
+        except Exception:
+            files = _download_with_format_stream(
+                url=url, out_dir=out_dir, fmt="bestvideo+bestaudio/best",
+                merge_output_format="mp4", extract_mp3=False,
+                on_line=on_line, playlist=True, write_metadata=write_metadata,
+                abort_event=abort_event, archive_path=archive_path,
+                on_file_done=_completion_cb,
             )
 
-        if not files:
-            raise RuntimeError("No tracks could be downloaded from this playlist.")
+    if on_file_done is not None:
+        files = list(_completed_files)
 
-        # ---- Playlist fill-in passes ---------------------------------------
-        # --ignore-errors causes yt-dlp to silently skip a track once its
-        # internal retries are exhausted, so the job exits cleanly with fewer
-        # files than expected.  We fix this by re-running yt-dlp on the same
-        # playlist URL up to (YTPDL_PLAYLIST_PASSES - 1) extra times.  The
-        # --download-archive file records every completed track ID, so each
-        # re-run skips already-downloaded tracks instantly and only attempts
-        # the ones that failed.  We stop early when either:
-        #   (a) file count matches the expected playlist count, or
-        #   (b) a pass produced no new files — remaining tracks are
-        #       permanently unavailable (private, deleted, geo-blocked).
-        # Kept local to the VPS — Render's retry system handles connection-
-        # level failures (rate limits, VPS errors); this handles per-track
-        # transient failures within an otherwise healthy job.
-        _passes = int(os.environ.get("YTPDL_PLAYLIST_PASSES", "5"))
-        _expected = _expected_count[0] if _expected_count else None
+    # If the IP was rate-limited, raise so Render's retry loop fires and
+    # cycles Mullvad. The archive file means the retry picks up where we left off.
+    if abort_event.is_set():
+        raise RuntimeError(
+            "Rate limited by YouTube — retrying with fresh VPN IP. "
+            "Already-downloaded tracks will be skipped on retry."
+        )
 
-        for _pass in range(1, _passes):
-            if _expected is not None and len(files) >= _expected:
-                break
-            prev_count = len(files)
-            missing = (_expected - prev_count) if _expected else "some"
-            _orig_on_line(f"[info] {missing} track(s) missing — playlist pass {_pass + 1}/{_passes}")
-            fill_abort = threading.Event()
-            try:
-                if mode == "mp3":
+    if not files and on_file_done is None:
+        raise RuntimeError("No tracks could be downloaded from this playlist.")
+
+    # ---- Playlist fill-in passes ---------------------------------------
+    # --ignore-errors causes yt-dlp to silently skip a track once its
+    # internal retries are exhausted, so the job exits cleanly with fewer
+    # files than expected.  We fix this by re-running yt-dlp on the same
+    # playlist URL up to (YTPDL_PLAYLIST_PASSES - 1) extra times.  The
+    # --download-archive file records every completed track ID, so each
+    # re-run skips already-downloaded tracks instantly and only attempts
+    # the ones that failed.  We stop early when either:
+    #   (a) file count matches the expected playlist count, or
+    #   (b) a pass produced no new files — remaining tracks are
+    #       permanently unavailable (private, deleted, geo-blocked).
+    # Kept local to the VPS — Render's retry system handles connection-
+    # level failures (rate limits, VPS errors); this handles per-track
+    # transient failures within an otherwise healthy job.
+    _passes = int(os.environ.get("YTPDL_PLAYLIST_PASSES", "5"))
+    _expected = _expected_count[0] if _expected_count else None
+
+    for _pass in range(1, _passes):
+        if _expected is not None and len(files) >= _expected:
+            break
+        prev_count = len(files)
+        missing = (_expected - prev_count) if _expected else "some"
+        _orig_on_line(f"[info] {missing} track(s) missing — playlist pass {_pass + 1}/{_passes}")
+        fill_abort = threading.Event()
+        try:
+            if mode == "mp3":
+                files = _download_with_format_stream(
+                    url=url, out_dir=out_dir, fmt="bestaudio/best",
+                    merge_output_format=None, extract_mp3=True,
+                    on_line=on_line, playlist=True, write_metadata=write_metadata,
+                    abort_event=fill_abort, archive_path=archive_path,
+                    on_file_done=_completion_cb,
+                )
+            elif mode == "best":
+                try:
                     files = _download_with_format_stream(
-                        url=url, out_dir=out_dir, fmt="bestaudio/best",
-                        merge_output_format=None, extract_mp3=True,
+                        url=url, out_dir=out_dir, fmt=_fmt_best(cap),
+                        merge_output_format=None, extract_mp3=False,
                         on_line=on_line, playlist=True, write_metadata=write_metadata,
                         abort_event=fill_abort, archive_path=archive_path,
+                        on_file_done=_completion_cb,
                     )
-                elif mode == "best":
-                    try:
-                        files = _download_with_format_stream(
-                            url=url, out_dir=out_dir, fmt=_fmt_best(cap),
-                            merge_output_format=None, extract_mp3=False,
-                            on_line=on_line, playlist=True, write_metadata=write_metadata,
-                            abort_event=fill_abort, archive_path=archive_path,
-                        )
-                    except Exception:
-                        try:
-                            files = _download_with_format_stream(
-                                url=url, out_dir=out_dir, fmt=_fmt_mp4_apple_safe(cap),
-                                merge_output_format="mp4", extract_mp3=False,
-                                on_line=on_line, playlist=True, write_metadata=write_metadata,
-                                abort_event=fill_abort, archive_path=archive_path,
-                            )
-                        except Exception:
-                            files = _download_with_format_stream(
-                                url=url, out_dir=out_dir, fmt="bestvideo+bestaudio/best",
-                                merge_output_format="mp4", extract_mp3=False,
-                                on_line=on_line, playlist=True, write_metadata=write_metadata,
-                                abort_event=fill_abort, archive_path=archive_path,
-                            )
-                else:
+                except Exception:
                     try:
                         files = _download_with_format_stream(
                             url=url, out_dir=out_dir, fmt=_fmt_mp4_apple_safe(cap),
                             merge_output_format="mp4", extract_mp3=False,
                             on_line=on_line, playlist=True, write_metadata=write_metadata,
                             abort_event=fill_abort, archive_path=archive_path,
+                            on_file_done=_completion_cb,
                         )
                     except Exception:
                         files = _download_with_format_stream(
@@ -957,36 +1233,55 @@ def download_playlist(
                             merge_output_format="mp4", extract_mp3=False,
                             on_line=on_line, playlist=True, write_metadata=write_metadata,
                             abort_event=fill_abort, archive_path=archive_path,
+                            on_file_done=_completion_cb,
                         )
-            except RuntimeError:
-                raise  # propagate rate-limit kills to Render's retry system
-            except Exception as e:
-                _orig_on_line(f"[info] Playlist pass {_pass + 1} error: {e} — keeping {len(files)} tracks")
-                break
-            if fill_abort.is_set():
-                raise RuntimeError(
-                    "Rate limited during playlist pass — retrying with fresh VPN IP. "
-                    "Already-downloaded tracks will be skipped on retry."
-                )
-            if len(files) <= prev_count:
-                _orig_on_line("[info] No new tracks recovered — remaining tracks are likely unavailable")
-                break
-            _orig_on_line(f"[info] Playlist pass {_pass + 1}: recovered {len(files) - prev_count} track(s)")
-        # ---- End playlist passes -------------------------------------------
+            else:
+                try:
+                    files = _download_with_format_stream(
+                        url=url, out_dir=out_dir, fmt=_fmt_mp4_apple_safe(cap),
+                        merge_output_format="mp4", extract_mp3=False,
+                        on_line=on_line, playlist=True, write_metadata=write_metadata,
+                        abort_event=fill_abort, archive_path=archive_path,
+                        on_file_done=_completion_cb,
+                    )
+                except Exception:
+                    files = _download_with_format_stream(
+                        url=url, out_dir=out_dir, fmt="bestvideo+bestaudio/best",
+                        merge_output_format="mp4", extract_mp3=False,
+                        on_line=on_line, playlist=True, write_metadata=write_metadata,
+                        abort_event=fill_abort, archive_path=archive_path,
+                        on_file_done=_completion_cb,
+                    )
+        except RuntimeError:
+            raise  # propagate rate-limit kills to Render's retry system
+        except Exception as e:
+            _orig_on_line(f"[info] Playlist pass {_pass + 1} error: {e} — keeping {len(files)} tracks")
+            break
+        if on_file_done is not None:
+            files = list(_completed_files)
+        if fill_abort.is_set():
+            raise RuntimeError(
+                "Rate limited during playlist pass — retrying with fresh VPN IP. "
+                "Already-downloaded tracks will be skipped on retry."
+            )
+        if len(files) <= prev_count:
+            _orig_on_line("[info] No new tracks recovered — remaining tracks are likely unavailable")
+            break
+        _orig_on_line(f"[info] Playlist pass {_pass + 1}: recovered {len(files) - prev_count} track(s)")
+    # ---- End playlist passes -------------------------------------------
 
-        title = _playlist_title[0] if _playlist_title else None
-        stem = _sanitize_filename_stem(title)
+    title = _playlist_title[0] if _playlist_title else None
+    stem = _sanitize_filename_stem(title)
 
-        # ZIP of individual tracks — returned as primary result.
-        # The worker uploads each track to R2 (sequential playback) and the
-        # ZIP (download button); Render just records the announced keys.
-        zip_path = os.path.join(out_dir, f"{stem}.zip")
+    # The ZIP name remains the job's primary result. Local/standalone mode
+    # creates it here. R2 collection mode keeps the source media files local
+    # and lets api.py stream them directly into an R2 multipart ZIP, avoiding
+    # a second full-size local copy.
+    zip_path = os.path.join(out_dir, f"{stem}.zip")
+    if not skip_collection_zip and on_file_done is None:
         _create_zip(files, zip_path)
 
-        return zip_path
-
-    finally:
-        pass  # VPN stays connected — never disconnect mid-service
+    return zip_path
 
 # =========================
 # Multi-URL downloader
@@ -999,6 +1294,8 @@ def download_multi_url(
     out_dir: str = DEFAULT_OUT_DIR,
     on_line: Callable[[str], None],
     write_metadata: bool = False,
+    on_file_done: Optional[Callable[[str], None]] = None,
+    skip_collection_zip: bool = False,
 ) -> str:
     """
     Download a comma-separated list of URLs into a single ZIP (multi_url.zip).
@@ -1012,7 +1309,7 @@ def download_multi_url(
     os.makedirs(out_dir, exist_ok=True)
 
     validate_environment()
-    _ensure_mullvad()
+    _ensure_vpn()
 
     # Emit total item count across all URLs before any downloading starts
     # so the frontend progress bar is scaled correctly from the beginning.
@@ -1030,13 +1327,13 @@ def download_multi_url(
     def _on_line_intercepted(line: str) -> None:
         if (_BOT_RX.search(line) or _PH_BOT_RX.search(line)) and not shared_abort.is_set():
             shared_abort.set()
-            _rotate_mullvad()
+            _rotate_vpn()
             on_line("[info] Rate limited — rotating VPN IP and retrying")
         on_line(line)
 
     def _run(url: str, url_dir: str, is_pl: bool,
              fmt: str, merge_fmt: Optional[str], mp3: bool,
-             ab: threading.Event) -> List[str]:
+             ab: threading.Event, done_cb: Optional[Callable[[str], None]] = None) -> List[str]:
         archive = os.path.join(url_dir, ".ytdlp-archive") if is_pl else None
         result = _download_with_format_stream(
             url=url, out_dir=url_dir, fmt=fmt,
@@ -1044,90 +1341,111 @@ def download_multi_url(
             on_line=_on_line_intercepted, playlist=is_pl,
             abort_event=ab, archive_path=archive,
             write_metadata=write_metadata,
+            on_file_done=(done_cb if is_pl else None),
         )
-        return [result] if isinstance(result, str) else result
+        paths = [result] if isinstance(result, str) else result
+        if done_cb is not None and not is_pl:
+            for p in paths:
+                if p:
+                    done_cb(p)
+        return paths
 
-    try:
-        for i, url in enumerate(urls):
-            if shared_abort.is_set():
-                raise RuntimeError(
-                    "Rate limited — retrying with fresh VPN IP. Re-submit to continue."
-                )
+    for i, url in enumerate(urls):
+        if shared_abort.is_set():
+            raise RuntimeError(
+                "Rate limited — retrying with fresh VPN IP. Re-submit to continue."
+            )
 
-            url_dir = os.path.join(out_dir, f"url_{i:03d}")
-            os.makedirs(url_dir, exist_ok=True)
-            on_line(f"[info] URL {i + 1}/{len(urls)}: {url}")
+        url_dir = os.path.join(out_dir, f"url_{i:03d}")
+        os.makedirs(url_dir, exist_ok=True)
+        on_line(f"[info] URL {i + 1}/{len(urls)}: {url}")
 
-            is_pl = is_playlist_url(url)
-            # Force mp3 for SoundCloud per-URL regardless of user format choice.
-            effective_mode = "mp3" if _SC_URL_RE.search(url) else mode
+        is_pl = is_playlist_url(url)
+        # Force mp3 for SoundCloud per-URL regardless of user format choice.
+        effective_mode = "mp3" if _SC_URL_RE.search(url) else mode
 
-            ua = threading.Event()
-            if effective_mode == "mp3":
-                files = _run(url, url_dir, is_pl, "bestaudio/best", None, True, ua)
-            elif effective_mode == "best":
+        _url_completed: List[str] = []
+        _url_seen: set[str] = set()
+
+        def _url_done(path: str) -> None:
+            ap = os.path.abspath(path)
+            if ap not in _url_seen:
+                _url_seen.add(ap)
+                _url_completed.append(ap)
+            if on_file_done is not None:
+                on_file_done(ap)
+
+        _url_cb = _url_done if on_file_done is not None else None
+
+        ua = threading.Event()
+        if effective_mode == "mp3":
+            files = _run(url, url_dir, is_pl, "bestaudio/best", None, True, ua, _url_cb)
+        elif effective_mode == "best":
+            try:
+                files = _run(url, url_dir, is_pl, _fmt_best(cap), None, False, ua, _url_cb)
+            except Exception:
                 try:
-                    files = _run(url, url_dir, is_pl, _fmt_best(cap), None, False, ua)
+                    files = _run(url, url_dir, is_pl, _fmt_mp4_apple_safe(cap), "mp4", False, ua, _url_cb)
                 except Exception:
-                    try:
-                        files = _run(url, url_dir, is_pl, _fmt_mp4_apple_safe(cap), "mp4", False, ua)
-                    except Exception:
-                        files = _run(url, url_dir, is_pl, "bestvideo+bestaudio/best", "mp4", False, ua)
-            else:
+                    files = _run(url, url_dir, is_pl, "bestvideo+bestaudio/best", "mp4", False, ua, _url_cb)
+        else:
+            try:
+                files = _run(url, url_dir, is_pl, _fmt_mp4_apple_safe(cap), "mp4", False, ua, _url_cb)
+            except Exception:
+                files = _run(url, url_dir, is_pl, "bestvideo+bestaudio/best", "mp4", False, ua, _url_cb)
+
+        if on_file_done is not None:
+            files = list(_url_completed)
+
+        if ua.is_set():
+            raise RuntimeError("Rate limited — retrying with fresh VPN IP.")
+
+        # Playlist fill-in passes (mirrors download_playlist logic).
+        if is_pl and files:
+            for _pass in range(1, _passes):
+                prev = len(files)
+                pa = threading.Event()
                 try:
-                    files = _run(url, url_dir, is_pl, _fmt_mp4_apple_safe(cap), "mp4", False, ua)
+                    if effective_mode == "mp3":
+                        files = _run(url, url_dir, True, "bestaudio/best", None, True, pa, _url_cb)
+                    elif effective_mode == "best":
+                        try:
+                            files = _run(url, url_dir, True, _fmt_best(cap), None, False, pa, _url_cb)
+                        except Exception:
+                            try:
+                                files = _run(url, url_dir, True, _fmt_mp4_apple_safe(cap), "mp4", False, pa, _url_cb)
+                            except Exception:
+                                files = _run(url, url_dir, True, "bestvideo+bestaudio/best", "mp4", False, pa, _url_cb)
+                    else:
+                        try:
+                            files = _run(url, url_dir, True, _fmt_mp4_apple_safe(cap), "mp4", False, pa, _url_cb)
+                        except Exception:
+                            files = _run(url, url_dir, True, "bestvideo+bestaudio/best", "mp4", False, pa, _url_cb)
+                except RuntimeError:
+                    raise
                 except Exception:
-                    files = _run(url, url_dir, is_pl, "bestvideo+bestaudio/best", "mp4", False, ua)
+                    break
+                if on_file_done is not None:
+                    files = list(_url_completed)
+                if pa.is_set():
+                    raise RuntimeError("Rate limited during playlist pass — retrying.")
+                if len(files) <= prev:
+                    break
 
-            if ua.is_set():
-                raise RuntimeError("Rate limited — retrying with fresh VPN IP.")
+        all_files.extend(files)
 
-            # Playlist fill-in passes (mirrors download_playlist logic).
-            if is_pl and files:
-                for _pass in range(1, _passes):
-                    prev = len(files)
-                    pa = threading.Event()
-                    try:
-                        if effective_mode == "mp3":
-                            files = _run(url, url_dir, True, "bestaudio/best", None, True, pa)
-                        elif effective_mode == "best":
-                            try:
-                                files = _run(url, url_dir, True, _fmt_best(cap), None, False, pa)
-                            except Exception:
-                                try:
-                                    files = _run(url, url_dir, True, _fmt_mp4_apple_safe(cap), "mp4", False, pa)
-                                except Exception:
-                                    files = _run(url, url_dir, True, "bestvideo+bestaudio/best", "mp4", False, pa)
-                        else:
-                            try:
-                                files = _run(url, url_dir, True, _fmt_mp4_apple_safe(cap), "mp4", False, pa)
-                            except Exception:
-                                files = _run(url, url_dir, True, "bestvideo+bestaudio/best", "mp4", False, pa)
-                    except RuntimeError:
-                        raise
-                    except Exception:
-                        break
-                    if pa.is_set():
-                        raise RuntimeError("Rate limited during playlist pass — retrying.")
-                    if len(files) <= prev:
-                        break
+    if not all_files and on_file_done is None:
+        raise RuntimeError("No files could be downloaded from the provided URLs.")
 
-            all_files.extend(files)
-
-        if not all_files:
-            raise RuntimeError("No files could be downloaded from the provided URLs.")
-
-        # ZIP all files — returned as primary result.
-        # The worker uploads each track to R2 (sequential playback) and the
-        # ZIP (download button); Render just records the announced keys.
-        # Codec differences between URLs are not an issue.
-        zip_path = os.path.join(out_dir, "multi_url.zip")
+    # The ZIP name remains the primary result. Local mode creates it here;
+    # R2 collection mode leaves it virtual while api.py streams the retained
+    # local media files directly into R2. Codec differences between URLs are
+    # not an issue.
+    zip_path = os.path.join(out_dir, "multi_url.zip")
+    if not skip_collection_zip and on_file_done is None:
         _create_zip(all_files, zip_path)
 
-        return zip_path
-
-    finally:
-        pass  # VPN stays connected — never disconnect mid-service
+    return zip_path
 # =========================
 def download_video(
     *,
@@ -1137,6 +1455,8 @@ def download_video(
     out_dir: str = DEFAULT_OUT_DIR,
     on_line: Callable[[str], None],
     write_metadata: bool = False,
+    on_file_done: Optional[Callable[[str], None]] = None,
+    skip_collection_zip: bool = False,
 ) -> str:
     """
     Download a single video/audio URL, or a full playlist.
@@ -1152,6 +1472,7 @@ def download_video(
             return download_multi_url(
                 urls=urls, resolution=resolution, extension=extension,
                 out_dir=out_dir, on_line=on_line, write_metadata=write_metadata,
+                on_file_done=on_file_done, skip_collection_zip=skip_collection_zip,
             )
         url = urls[0]  # single URL with stray trailing comma
 
@@ -1159,54 +1480,52 @@ def download_video(
         return download_playlist(
             url=url, resolution=resolution, extension=extension,
             out_dir=out_dir, on_line=on_line, write_metadata=write_metadata,
+            on_file_done=on_file_done, skip_collection_zip=skip_collection_zip,
         )
 
     out_dir = os.path.abspath(out_dir)
     os.makedirs(out_dir, exist_ok=True)
     validate_environment()
-    _ensure_mullvad()
+    _ensure_vpn()
 
-    try:
-        mode = (extension or "mp4").lower().strip()
-        cap = int(resolution or 1080)
+    mode = (extension or "mp4").lower().strip()
+    cap = int(resolution or 1080)
 
-        if mode == "mp3":
-            return _download_with_format_stream(
-                url=url, out_dir=out_dir, fmt="bestaudio/best",
-                merge_output_format=None, extract_mp3=True, on_line=on_line,
-                write_metadata=write_metadata,
-            )
-        if mode == "best":
-            try:
-                return _download_with_format_stream(
-                    url=url, out_dir=out_dir, fmt=_fmt_best(cap),
-                    merge_output_format=None, extract_mp3=False, on_line=on_line,
-                    write_metadata=write_metadata,
-                )
-            except Exception:
-                try:
-                    return _download_with_format_stream(
-                        url=url, out_dir=out_dir, fmt=_fmt_mp4_apple_safe(cap),
-                        merge_output_format="mp4", extract_mp3=False, on_line=on_line,
-                        write_metadata=write_metadata,
-                    )
-                except Exception:
-                    return _download_with_format_stream(
-                        url=url, out_dir=out_dir, fmt="bestvideo+bestaudio/best",
-                        merge_output_format="mp4", extract_mp3=False, on_line=on_line,
-                        write_metadata=write_metadata,
-                    )
+    if mode == "mp3":
+        return _download_with_format_stream(
+            url=url, out_dir=out_dir, fmt="bestaudio/best",
+            merge_output_format=None, extract_mp3=True, on_line=on_line,
+            write_metadata=write_metadata,
+        )
+    if mode == "best":
         try:
             return _download_with_format_stream(
-                url=url, out_dir=out_dir, fmt=_fmt_mp4_apple_safe(cap),
-                merge_output_format="mp4", extract_mp3=False, on_line=on_line,
+                url=url, out_dir=out_dir, fmt=_fmt_best(cap),
+                merge_output_format=None, extract_mp3=False, on_line=on_line,
                 write_metadata=write_metadata,
             )
         except Exception:
-            return _download_with_format_stream(
-                url=url, out_dir=out_dir, fmt="bestvideo+bestaudio/best",
-                merge_output_format="mp4", extract_mp3=False, on_line=on_line,
-                write_metadata=write_metadata,
-            )
-    finally:
-        pass  # VPN stays connected — never disconnect mid-service
+            try:
+                return _download_with_format_stream(
+                    url=url, out_dir=out_dir, fmt=_fmt_mp4_apple_safe(cap),
+                    merge_output_format="mp4", extract_mp3=False, on_line=on_line,
+                    write_metadata=write_metadata,
+                )
+            except Exception:
+                return _download_with_format_stream(
+                    url=url, out_dir=out_dir, fmt="bestvideo+bestaudio/best",
+                    merge_output_format="mp4", extract_mp3=False, on_line=on_line,
+                    write_metadata=write_metadata,
+                )
+    try:
+        return _download_with_format_stream(
+            url=url, out_dir=out_dir, fmt=_fmt_mp4_apple_safe(cap),
+            merge_output_format="mp4", extract_mp3=False, on_line=on_line,
+            write_metadata=write_metadata,
+        )
+    except Exception:
+        return _download_with_format_stream(
+            url=url, out_dir=out_dir, fmt="bestvideo+bestaudio/best",
+            merge_output_format="mp4", extract_mp3=False, on_line=on_line,
+            write_metadata=write_metadata,
+        )
