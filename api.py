@@ -23,7 +23,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 
 from flask import Flask, Response, jsonify, redirect, request, send_file, stream_with_context
 
-from .downloader import download_video, validate_environment, is_playlist_url
+from .downloader import DiskPressureError, download_video, validate_environment, is_playlist_url
 
 app = Flask(__name__)
 
@@ -47,7 +47,7 @@ CLEANUP_INTERVAL_S = int(os.environ.get("YTPDL_CLEANUP_INTERVAL_S", "60"))
 _ACTIVE_JOB_LOCK_DIR = os.environ.get("YTPDL_ACTIVE_LOCK_DIR", "/run/ytpdl-active")
 _CLEANUP_LOCK_PATH = os.environ.get("YTPDL_CLEANUP_LOCK_PATH", "/run/lock/ytpdl-cleanup.lock")
 R2_ZIP_PART_SIZE_MB = max(5, int(os.environ.get("YTPDL_R2_ZIP_PART_SIZE_MB", "16")))
-R2_ZIP_WORKERS = max(1, int(os.environ.get("YTPDL_R2_ZIP_WORKERS", "10")))
+R2_ZIP_WORKERS = max(1, int(os.environ.get("YTPDL_R2_ZIP_WORKERS", "6")))
 os.makedirs(_ACTIVE_JOB_LOCK_DIR, exist_ok=True)
 os.makedirs(os.path.dirname(_CLEANUP_LOCK_PATH), exist_ok=True)
 
@@ -585,7 +585,7 @@ def _square_crop(path: str) -> None:
 def _upload_thumb_for(*, media_path: str, job_id: str, push) -> None:
     """
     Upload the sidecar thumbnail for a media file to R2 and emit
-    [meta_thumb] media=<media_filename>\tkey=<key> so Render can correlate the
+    [meta_thumb] media=<media_filename>\tkey=<key> so the relay can correlate the
     thumbnail to its track and rewrite it into a worker URL for Media Session.
 
     Best-effort: any failure is silently ignored — artwork is non-essential and
@@ -1145,7 +1145,7 @@ def handle_download():
         q: "queue.Queue[str]" = queue.Queue(maxsize=50000)
         done = threading.Event()
         enospc_seen = threading.Event()
-        result: dict = {"path": None, "error": None, "r2_key": None, "r2_error": None}
+        result: dict = {"path": None, "error": None, "r2_key": None, "r2_error": None, "storage_pressure": False}
 
         def push(line: str) -> None:
             text = str(line)
@@ -1248,11 +1248,16 @@ def handle_download():
 
             except Exception as e:
                 result["error"] = str(e)
-                disk_full_failure = enospc_seen.is_set() or _is_enospc(e)
+                disk_full_failure = (
+                    isinstance(e, DiskPressureError)
+                    or enospc_seen.is_set()
+                    or _is_enospc(e)
+                )
+                result["storage_pressure"] = disk_full_failure
                 if disk_full_failure:
                     # ENOSPC is different from an ordinary failed download:
                     # retaining multi-GB partials only delays recovery, and the
-                    # Render relay uses a fresh VPS job_id for its next attempt.
+                    # The relay uses a fresh server job_id for its next attempt.
                     # Reclaim this failed job's payload immediately.
                     _purge_job_payload_keep_meta(job_dir)
                 else:
@@ -1297,6 +1302,11 @@ def handle_download():
                     continue
 
             if result.get("error"):
+                if result.get("storage_pressure"):
+                    yield (
+                        "data: [storage_pressure] Temporary VPS storage pressure; "
+                        "waiting for the disk reserve to recover.\n\n"
+                    )
                 yield f"data: [error] {result['error']}\n\n"
                 yield "data: [done]\n\n"
                 return
@@ -1501,7 +1511,16 @@ def fetch_job_file(job_id: str, filename: str):
 
 @app.route("/healthz", methods=["GET"])
 def healthz():
-    return jsonify(ok=True, in_use=_global_in_use(), capacity=MAX_CONCURRENT), 200
+    free_disk_mb = _free_disk_mb()
+    disk_ready = free_disk_mb >= MIN_FREE_DISK_MB
+    return jsonify(
+        ok=True,
+        in_use=_global_in_use(),
+        capacity=MAX_CONCURRENT,
+        free_disk_mb=round(free_disk_mb, 1),
+        min_free_disk_mb=MIN_FREE_DISK_MB,
+        disk_ready=disk_ready,
+    ), 200
 
 
 def main():
