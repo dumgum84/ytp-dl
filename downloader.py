@@ -6,6 +6,8 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import fcntl
+import errno
 import subprocess
 import signal
 import threading
@@ -32,6 +34,27 @@ DEFAULT_OUT_DIR = os.environ.get("YTPDL_DOWNLOAD_DIR", "/root")
 
 JOB_TIMEOUT_S = int(os.environ.get("YTPDL_JOB_TIMEOUT_S", "1800"))
 PLAYLIST_JOB_TIMEOUT_S = int(os.environ.get("YTPDL_PLAYLIST_JOB_TIMEOUT_S", "21600"))
+# Bound individual network operations. This is intentionally much shorter than
+# the whole-job timeout: a dead/blackholed YouTube route must not hold a VPS
+# concurrency slot for many minutes while the OS waits on TCP retries.
+SOCKET_TIMEOUT_S = max(3, int(os.environ.get("YTPDL_SOCKET_TIMEOUT_S", "10")))
+# `ensure`/`rotate` can now perform account reconciliation + regenerate the relay
+# set after normal failover is exhausted, so their hard timeout must be longer
+# than the old relay-only 45s ceiling. Ordinary yt-dlp socket operations still
+# use SOCKET_TIMEOUT_S above.
+VPN_RECOVERY_TIMEOUT_S = max(45, int(os.environ.get("YTPDL_VPN_RECOVERY_TIMEOUT_S", "180")))
+
+# Keep a real free-space reserve while downloads are active, not just at API
+# admission time. The first job that notices pressure claims a VPS-global flock,
+# terminates its own yt-dlp process tree, removes its own job payload, and then
+# releases the lock. If the reserve is still low, exactly one other job can make
+# the same decision on the next check.
+MIN_FREE_DISK_MB = max(0, int(os.environ.get("YTPDL_MIN_FREE_DISK_MB", "8192")))
+DISK_CHECK_INTERVAL_S = max(0.25, float(os.environ.get("YTPDL_DISK_CHECK_INTERVAL_S", "1.0")))
+DISK_PRESSURE_LOCK_PATH = os.environ.get(
+    "YTPDL_DISK_PRESSURE_LOCK_PATH", "/run/lock/ytpdl-disk-pressure.lock"
+)
+JOB_BASE_DIR = os.path.abspath(os.environ.get("YTPDL_JOB_BASE_DIR", "/root/ytpdl_jobs"))
 
 
 _MAX_ERR_LINES = 80
@@ -54,9 +77,111 @@ _PH_BOT_RX = re.compile(
     re.IGNORECASE,
 )
 
+# A Mullvad relay can remain generally healthy while YouTube specifically stops
+# accepting TCP/TLS connections from that exit IP. The failure then appears as a
+# connection timeout/reset rather than HTTP 429, so the old bot-only detector
+# never rotated the exit and all download slots could eventually fill with stuck
+# yt-dlp processes. Only treat these as a VPN-exit problem for YouTube, and only
+# after a direct YouTube probe through the namespace also fails.
+_YT_URL_RE = re.compile(r"(?:youtube\.com|youtu\.be)", re.IGNORECASE)
+_NETWORK_RX = re.compile(
+    r"connection (?:timed out|timeout|reset|refused)"
+    r"|timed out"
+    r"|network is unreachable"
+    r"|no route to host"
+    r"|failed to establish a new connection"
+    r"|temporary failure in name resolution"
+    r"|name or service not known"
+    r"|remote end closed connection",
+    re.IGNORECASE,
+)
+
+
+_ENOSPC_RX = re.compile(r"no space left on device|errno\s*28|\[errno\s*28\]", re.IGNORECASE)
+
+
+class DiskPressureError(RuntimeError):
+    """The VPS free-space reserve was breached; this job was aborted for recovery."""
+
+
+def _free_disk_mb(path: str) -> float:
+    try:
+        st = os.statvfs(path)
+        return (st.f_bavail * st.f_frsize) / (1024 * 1024)
+    except Exception:
+        return float("inf")
+
+
+def _kill_process_group(proc) -> None:
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def _job_root_for(out_dir: str) -> str | None:
+    """Return the owning ytpdl_* job dir, but never escape JOB_BASE_DIR."""
+    try:
+        base = os.path.realpath(JOB_BASE_DIR)
+        cur = os.path.realpath(out_dir)
+        if os.path.commonpath([base, cur]) != base:
+            return None
+        while cur != base:
+            if os.path.basename(cur).startswith("ytpdl_"):
+                return cur
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
+    except Exception:
+        return None
+    return None
+
+
+def _try_disk_pressure_lock() -> int | None:
+    try:
+        os.makedirs(os.path.dirname(DISK_PRESSURE_LOCK_PATH), exist_ok=True)
+        fd = os.open(DISK_PRESSURE_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except (BlockingIOError, OSError):
+            os.close(fd)
+            return None
+    except Exception:
+        return None
+
+
+def _release_disk_pressure_lock(fd: int | None) -> None:
+    if fd is None:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        os.close(fd)
+    except Exception:
+        pass
+
+
+def _purge_own_job_for_disk_pressure(out_dir: str) -> None:
+    job_root = _job_root_for(out_dir)
+    if job_root:
+        shutil.rmtree(job_root, ignore_errors=True)
+
+
+class _VpnRecoveryNeeded(RuntimeError):
+    """Abort the current format attempt and let the caller retry on the fresh VPN exit."""
+
 
 # SoundCloud is audio-only — used by download_multi_url for per-URL
-# format forcing without relying on the Render-side SC override.
+# format forcing without relying on a relay-side SoundCloud override.
 _SC_URL_RE = re.compile(r"soundcloud\.com", re.IGNORECASE)
 
 # PornHub blocks non-browser TLS fingerprints (HTTP 410/403).
@@ -84,23 +209,60 @@ def _vpn_helper_present() -> bool:
 
 
 def _vpn_command(action: str, *, timeout: int = 45) -> tuple[int, str]:
+    """Run the VPN helper with a hard timeout for its entire process tree.
+
+    The helper can spawn flock/curl/sleep children.  If only the parent shell is
+    timed out, a descendant can survive long enough to keep the global VPN lock
+    held and make later downloads queue behind a dead recovery attempt.  Start a
+    dedicated process group and kill the whole group on timeout.
+    """
+    proc = None
     try:
-        res = subprocess.run(
+        proc = subprocess.Popen(
             [VPN_HELPER, action],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            timeout=timeout,
+            start_new_session=True,
         )
-        return res.returncode, (res.stdout or "")
+        out, _ = proc.communicate(timeout=timeout)
+        return proc.returncode, (out or "")
+    except subprocess.TimeoutExpired:
+        out = ""
+        if proc is not None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            try:
+                out, _ = proc.communicate(timeout=5)
+            except Exception:
+                pass
+        msg = f"VPN helper '{action}' timed out after {timeout}s"
+        if out:
+            msg += f"\n{out}"
+        return 124, msg
     except Exception as e:
+        if proc is not None and proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
         return 1, str(e)
 
 
 def _vpn_is_connected() -> bool:
     if not _vpn_helper_present():
         return False
-    rc, _ = _vpn_command("status", timeout=10)
+    rc, _ = _vpn_command("status", timeout=5)
     return rc == 0
 
 
@@ -116,7 +278,7 @@ def _ensure_vpn() -> None:
     with _vpn_thread_lock:
         if _vpn_is_connected():
             return
-        rc, out = _vpn_command("ensure", timeout=60)
+        rc, out = _vpn_command("ensure", timeout=VPN_RECOVERY_TIMEOUT_S)
         if rc != 0:
             raise RuntimeError(f"Mullvad namespace connection failed\n{_tail(out)}")
 
@@ -124,7 +286,7 @@ def _ensure_vpn() -> None:
 def _rotate_vpn() -> None:
     """Rotate only the isolated yt-dlp tunnel; host networking is untouched."""
     with _vpn_thread_lock:
-        rc, out = _vpn_command("rotate", timeout=60)
+        rc, out = _vpn_command("rotate", timeout=VPN_RECOVERY_TIMEOUT_S)
         if rc != 0:
             raise RuntimeError(f"Mullvad namespace rotation failed\n{_tail(out)}")
 
@@ -132,6 +294,37 @@ def _rotate_vpn() -> None:
 def _vpn_exec_argv(argv: List[str]) -> List[str]:
     """Wrap a command so it executes inside the isolated VPN namespace."""
     return [VPN_HELPER, "exec", "--", *argv]
+
+
+def _is_youtube_url(url: str) -> bool:
+    return bool(_YT_URL_RE.search(url or ""))
+
+
+def _youtube_probe_ok() -> bool:
+    """Return True only when YouTube itself is reachable through Mullvad.
+
+    The generic Mullvad health endpoint can stay green while YouTube silently
+    blackholes the current exit. A short HEAD probe mirrors the failure mode
+    observed in production without downloading media or consuming a job slot.
+    """
+    if not _vpn_helper_present():
+        return False
+    try:
+        result = subprocess.run(
+            _vpn_exec_argv([
+                "curl", "-fsSI",
+                "-A", MODERN_UA,
+                "--connect-timeout", "3",
+                "--max-time", "5",
+                "https://www.youtube.com/",
+            ]),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=7,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
 
 
 # =========================
@@ -206,6 +399,7 @@ def _common_flags(*, playlist: bool = False) -> List[str]:
         "--fragment-retries", "10",
         "--extractor-retries", "10",
         "--retry-sleep", "exp=1:30",
+        "--socket-timeout", str(SOCKET_TIMEOUT_S),
         "--user-agent", MODERN_UA,
         "--ignore-config",
         "--embed-metadata",
@@ -271,6 +465,7 @@ def _get_url_item_count(url: str) -> int:
                 "--no-cache-dir",
                 "--ignore-config",
                 "--retries", "2",
+                "--socket-timeout", str(SOCKET_TIMEOUT_S),
                 "--user-agent", MODERN_UA,
                 url,
             ]),
@@ -761,6 +956,7 @@ def _download_with_format_stream(
 
     tail_lines: Deque[str] = deque(maxlen=_MAX_ERR_LINES)
     candidates: List[str] = []
+    forced_vpn_retry = False
 
     def _maybe_add_candidate(p: str) -> None:
         p = (p or "").strip().strip("'\"")
@@ -809,6 +1005,58 @@ def _download_with_format_stream(
 
     threading.Thread(target=_killer, daemon=True).start()
 
+    disk_pressure = threading.Event()
+    disk_pressure_message = {"text": ""}
+    stop_disk_guard = threading.Event()
+
+    def _disk_guard():
+        if MIN_FREE_DISK_MB <= 0:
+            return
+        while not stop_disk_guard.wait(DISK_CHECK_INTERVAL_S):
+            if proc.poll() is not None:
+                return
+            free_mb = _free_disk_mb(out_dir)
+            if free_mb >= MIN_FREE_DISK_MB:
+                continue
+
+            pressure_fd = _try_disk_pressure_lock()
+            if pressure_fd is None:
+                continue
+            try:
+                # Another job may have finished/cleaned while this worker waited
+                # for the coordination lock, so always re-check before aborting.
+                free_mb = _free_disk_mb(out_dir)
+                if free_mb >= MIN_FREE_DISK_MB or proc.poll() is not None:
+                    continue
+
+                msg = (
+                    f"Disk reserve below {MIN_FREE_DISK_MB} MB "
+                    f"({free_mb:.0f} MB free); aborting one active job to recover space."
+                )
+                disk_pressure_message["text"] = msg
+                disk_pressure.set()
+                try:
+                    on_line(f"[storage_pressure] {msg}")
+                except Exception:
+                    pass
+
+                _kill_process_group(proc)
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+
+                # Reclaim this entire job while holding the global pressure lock.
+                # That makes the one-job-at-a-time policy real across Gunicorn
+                # workers: no second job is selected until these bytes are gone.
+                _purge_own_job_for_disk_pressure(out_dir)
+                return
+            finally:
+                _release_disk_pressure_lock(pressure_fd)
+
+    disk_guard_thread = threading.Thread(target=_disk_guard, daemon=True)
+    disk_guard_thread.start()
+
     try:
         for line in proc.stdout:
             s = (line or "").rstrip("\n")
@@ -842,6 +1090,26 @@ def _download_with_format_stream(
 
             on_line(s)
 
+            # yt-dlp can otherwise retry ENOSPC repeatedly and flood the logs.
+            # Kill immediately on the first real no-space line; API cleanup will
+            # treat this as temporary storage pressure rather than a format error.
+            if _ENOSPC_RX.search(s):
+                msg = "Filesystem reported ENOSPC; aborting this job and reclaiming its partial files."
+                disk_pressure_message["text"] = msg
+                disk_pressure.set()
+                try:
+                    on_line(f"[storage_pressure] {msg}")
+                except Exception:
+                    pass
+                _kill_process_group(proc)
+                pressure_fd = _try_disk_pressure_lock()
+                if pressure_fd is not None:
+                    try:
+                        _purge_own_job_for_disk_pressure(out_dir)
+                    finally:
+                        _release_disk_pressure_lock(pressure_fd)
+                break
+
             # If abort was signaled (e.g. rate-limited), kill yt-dlp immediately
             # rather than waiting for it to exhaust retries on every remaining track.
             if abort_event and abort_event.is_set():
@@ -854,7 +1122,7 @@ def _download_with_format_stream(
                         pass
                 break
 
-            # Bot detection — rotate IP immediately so Render's retry gets a fresh IP.
+            # Bot detection — rotate IP immediately so an upstream retry gets a fresh IP.
             if _BOT_RX.search(s) or _PH_BOT_RX.search(s):
                 if abort_event is not None:
                     if not abort_event.is_set():
@@ -863,6 +1131,28 @@ def _download_with_format_stream(
                 else:
                     # Single video path — rotate and let yt-dlp fail naturally.
                     _rotate_vpn()
+
+            # A YouTube-specific network stall is different from a generic VPN
+            # outage. Confirm it with a direct YouTube probe before rotating so
+            # an unrelated transient socket error does not churn the shared exit.
+            # Kill this yt-dlp process first; the caller can retry the job on the
+            # newly selected relay instead of letting yt-dlp burn through its
+            # large internal retry budget while holding a VPS slot.
+            if _is_youtube_url(url) and _NETWORK_RX.search(s):
+                if not _youtube_probe_ok():
+                    forced_vpn_retry = True
+                    if abort_event is not None:
+                        abort_event.set()
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                    on_line("[info] YouTube route stalled — rotating VPN IP and retrying")
+                    _rotate_vpn()
+                    break
 
             if os.path.isabs(s) and s.startswith(out_dir):
                 _maybe_add_candidate(s)
@@ -902,6 +1192,12 @@ def _download_with_format_stream(
         raise
     finally:
         stop_killer.set()
+        stop_disk_guard.set()
+        # A pressure guard sets the event before killing/purging. Wait for that
+        # cleanup to finish before the caller sees DiskPressureError; otherwise
+        # an upstream relay could requeue the job while its sacrificed payload still exists.
+        if disk_guard_thread.is_alive():
+            disk_guard_thread.join(timeout=10.0)
         try:
             proc.stdout.close()
         except Exception:
@@ -933,6 +1229,18 @@ def _download_with_format_stream(
                 os.unlink(finalize_fifo)
             except OSError:
                 pass
+
+    if disk_pressure.is_set():
+        raise DiskPressureError(
+            disk_pressure_message.get("text")
+            or f"Disk reserve below {MIN_FREE_DISK_MB} MB; job aborted for storage recovery."
+        )
+
+    if forced_vpn_retry:
+        raise _VpnRecoveryNeeded(
+            "YouTube connectivity through the current Mullvad exit failed; "
+            "the VPN was rotated for a clean retry."
+        )
 
     # ---- Playlist mode ----
     if playlist:
@@ -1020,12 +1328,34 @@ def _sanitize_filename_stem(title: str) -> str:
 # ZIP helper
 # =========================
 def _create_zip(files: List[str], zip_path: str) -> str:
-    """Bundle files into a ZIP. ZIP_STORED avoids wasting CPU on already-compressed media."""
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
-        for path in files:
-            if os.path.isfile(path):
-                zf.write(path, os.path.basename(path))
-    return zip_path
+    """Bundle files into a ZIP while preserving the configured disk reserve."""
+    try:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
+            for path in files:
+                if MIN_FREE_DISK_MB > 0 and _free_disk_mb(os.path.dirname(zip_path) or ".") < MIN_FREE_DISK_MB:
+                    raise DiskPressureError(
+                        f"Disk reserve below {MIN_FREE_DISK_MB} MB while creating ZIP; "
+                        "aborting for storage recovery."
+                    )
+                if os.path.isfile(path):
+                    zf.write(path, os.path.basename(path))
+        return zip_path
+    except OSError as e:
+        if getattr(e, "errno", None) == errno.ENOSPC or _ENOSPC_RX.search(str(e)):
+            try:
+                os.remove(zip_path)
+            except OSError:
+                pass
+            raise DiskPressureError(
+                "Filesystem reported ENOSPC while creating ZIP; partial ZIP removed."
+            ) from e
+        raise
+    except DiskPressureError:
+        try:
+            os.remove(zip_path)
+        except OSError:
+            pass
+        raise
 
 
 # =========================
@@ -1052,7 +1382,7 @@ def download_playlist(
     on_file_done remains available as a lightweight completion hook for callers.
 
     On 429/bot-detection, kills yt-dlp immediately and raises RuntimeError
-    so Render's existing retry loop fires and rotates the isolated Mullvad IP.
+    so the upstream retry loop can retry on the rotated isolated Mullvad IP.
     A --download-archive file in out_dir ensures already-downloaded tracks
     are skipped on retry — no duplicate downloads.
     """
@@ -1070,7 +1400,7 @@ def download_playlist(
     mode = (extension or "mp3").lower().strip()
     cap = int(resolution or 1080)
 
-    # Persists across Render retries (same job_dir) so re-runs skip completed tracks.
+    # Persists across retries using the same job_dir so re-runs skip completed tracks.
     archive_path = os.path.join(out_dir, ".ytdlp-archive")
 
     # Signals yt-dlp to be killed immediately when a rate-limit is detected.
@@ -1127,6 +1457,8 @@ def download_playlist(
                 abort_event=abort_event, archive_path=archive_path,
                 on_file_done=_completion_cb,
             )
+        except (_VpnRecoveryNeeded, DiskPressureError):
+            raise
         except Exception:
             try:
                 files = _download_with_format_stream(
@@ -1136,6 +1468,8 @@ def download_playlist(
                     abort_event=abort_event, archive_path=archive_path,
                     on_file_done=_completion_cb,
                 )
+            except (_VpnRecoveryNeeded, DiskPressureError):
+                raise
             except Exception:
                 files = _download_with_format_stream(
                     url=url, out_dir=out_dir, fmt="bestvideo+bestaudio/best",
@@ -1153,6 +1487,8 @@ def download_playlist(
                 abort_event=abort_event, archive_path=archive_path,
                 on_file_done=_completion_cb,
             )
+        except (_VpnRecoveryNeeded, DiskPressureError):
+            raise
         except Exception:
             files = _download_with_format_stream(
                 url=url, out_dir=out_dir, fmt="bestvideo+bestaudio/best",
@@ -1165,7 +1501,7 @@ def download_playlist(
     if on_file_done is not None:
         files = list(_completed_files)
 
-    # If the IP was rate-limited, raise so Render's retry loop fires and
+    # If the IP was rate-limited, raise so the upstream retry loop can run and
     # cycles Mullvad. The archive file means the retry picks up where we left off.
     if abort_event.is_set():
         raise RuntimeError(
@@ -1187,7 +1523,7 @@ def download_playlist(
     #   (a) file count matches the expected playlist count, or
     #   (b) a pass produced no new files — remaining tracks are
     #       permanently unavailable (private, deleted, geo-blocked).
-    # Kept local to the VPS — Render's retry system handles connection-
+    # Kept local to the server — the upstream retry system handles connection-
     # level failures (rate limits, VPS errors); this handles per-track
     # transient failures within an otherwise healthy job.
     _passes = int(os.environ.get("YTPDL_PLAYLIST_PASSES", "5"))
@@ -1218,6 +1554,8 @@ def download_playlist(
                         abort_event=fill_abort, archive_path=archive_path,
                         on_file_done=_completion_cb,
                     )
+                except (_VpnRecoveryNeeded, DiskPressureError):
+                    raise
                 except Exception:
                     try:
                         files = _download_with_format_stream(
@@ -1227,6 +1565,8 @@ def download_playlist(
                             abort_event=fill_abort, archive_path=archive_path,
                             on_file_done=_completion_cb,
                         )
+                    except (_VpnRecoveryNeeded, DiskPressureError):
+                        raise
                     except Exception:
                         files = _download_with_format_stream(
                             url=url, out_dir=out_dir, fmt="bestvideo+bestaudio/best",
@@ -1244,6 +1584,8 @@ def download_playlist(
                         abort_event=fill_abort, archive_path=archive_path,
                         on_file_done=_completion_cb,
                     )
+                except (_VpnRecoveryNeeded, DiskPressureError):
+                    raise
                 except Exception:
                     files = _download_with_format_stream(
                         url=url, out_dir=out_dir, fmt="bestvideo+bestaudio/best",
@@ -1253,7 +1595,7 @@ def download_playlist(
                         on_file_done=_completion_cb,
                     )
         except RuntimeError:
-            raise  # propagate rate-limit kills to Render's retry system
+            raise  # propagate rate-limit kills to the upstream retry system
         except Exception as e:
             _orig_on_line(f"[info] Playlist pass {_pass + 1} error: {e} — keeping {len(files)} tracks")
             break
@@ -1383,14 +1725,20 @@ def download_multi_url(
         elif effective_mode == "best":
             try:
                 files = _run(url, url_dir, is_pl, _fmt_best(cap), None, False, ua, _url_cb)
+            except (_VpnRecoveryNeeded, DiskPressureError):
+                raise
             except Exception:
                 try:
                     files = _run(url, url_dir, is_pl, _fmt_mp4_apple_safe(cap), "mp4", False, ua, _url_cb)
+                except (_VpnRecoveryNeeded, DiskPressureError):
+                    raise
                 except Exception:
                     files = _run(url, url_dir, is_pl, "bestvideo+bestaudio/best", "mp4", False, ua, _url_cb)
         else:
             try:
                 files = _run(url, url_dir, is_pl, _fmt_mp4_apple_safe(cap), "mp4", False, ua, _url_cb)
+            except (_VpnRecoveryNeeded, DiskPressureError):
+                raise
             except Exception:
                 files = _run(url, url_dir, is_pl, "bestvideo+bestaudio/best", "mp4", False, ua, _url_cb)
 
@@ -1411,14 +1759,20 @@ def download_multi_url(
                     elif effective_mode == "best":
                         try:
                             files = _run(url, url_dir, True, _fmt_best(cap), None, False, pa, _url_cb)
+                        except (_VpnRecoveryNeeded, DiskPressureError):
+                            raise
                         except Exception:
                             try:
                                 files = _run(url, url_dir, True, _fmt_mp4_apple_safe(cap), "mp4", False, pa, _url_cb)
+                            except (_VpnRecoveryNeeded, DiskPressureError):
+                                raise
                             except Exception:
                                 files = _run(url, url_dir, True, "bestvideo+bestaudio/best", "mp4", False, pa, _url_cb)
                     else:
                         try:
                             files = _run(url, url_dir, True, _fmt_mp4_apple_safe(cap), "mp4", False, pa, _url_cb)
+                        except (_VpnRecoveryNeeded, DiskPressureError):
+                            raise
                         except Exception:
                             files = _run(url, url_dir, True, "bestvideo+bestaudio/best", "mp4", False, pa, _url_cb)
                 except RuntimeError:
@@ -1504,6 +1858,8 @@ def download_video(
                 merge_output_format=None, extract_mp3=False, on_line=on_line,
                 write_metadata=write_metadata,
             )
+        except (_VpnRecoveryNeeded, DiskPressureError):
+            raise
         except Exception:
             try:
                 return _download_with_format_stream(
@@ -1511,6 +1867,8 @@ def download_video(
                     merge_output_format="mp4", extract_mp3=False, on_line=on_line,
                     write_metadata=write_metadata,
                 )
+            except (_VpnRecoveryNeeded, DiskPressureError):
+                raise
             except Exception:
                 return _download_with_format_stream(
                     url=url, out_dir=out_dir, fmt="bestvideo+bestaudio/best",
@@ -1523,6 +1881,8 @@ def download_video(
             merge_output_format="mp4", extract_mp3=False, on_line=on_line,
             write_metadata=write_metadata,
         )
+    except (_VpnRecoveryNeeded, DiskPressureError):
+        raise
     except Exception:
         return _download_with_format_stream(
             url=url, out_dir=out_dir, fmt="bestvideo+bestaudio/best",
